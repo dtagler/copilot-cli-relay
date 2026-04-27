@@ -1,0 +1,31 @@
+services:
+  proxy:
+    build: .
+    image: claude-copilot-cli-relay:dev
+    container_name: claude-copilot-cli-relay
+    env_file:
+      - .env
+    ports:
+      # Bind only to host loopback. Inside the container, uvicorn listens on 0.0.0.0:4141
+      # so the Docker publish can reach it; the host-side bind keeps it off the network.
+      - "127.0.0.1:4141:4141"
+    healthcheck:
+      # Liveness + upstream reachability. Uses python (already in the image)
+      # so we don't have to add curl/wget. Restart-on-stuck behavior is
+      # handled by `restart: unless-stopped` below — Compose itself doesn't
+      # restart unhealthy containers, but the healthcheck makes the state
+      # visible in `docker compose ps` and to any external orchestrator.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4141/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes:
+      # Read-only source mount for fast iteration. Restart container to pick up changes:
+      #   docker compose restart proxy
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+    # `unless-stopped` so the proxy survives Docker Desktop / host reboots
+    # without manual `docker compose up`. `docker compose down` and Ctrl-C
+    # still stop it cleanly. Crashes are visible in `docker compose logs`.
+    restart: unless-stopped

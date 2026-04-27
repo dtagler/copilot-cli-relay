@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.log
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Editor
+.vscode/
+.idea/
+
+# Tooling / agent config
+.github/
+
+# OS
+Thumbs.db
+.DS_Store

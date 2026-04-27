@@ -1,0 +1,49 @@
+[project]
+name = "claude-copilot-cli-relay"
+version = "0.1.0"
+description = "Reverse proxy that lets Claude Code use a GitHub Copilot Enterprise subscription via Copilot's native Anthropic Messages endpoint."
+requires-python = ">=3.14"
+dependencies = [
+    "starlette>=1.0",
+    "uvicorn[standard]>=0.46",
+    "httpx[http2]>=0.28",
+    "anyio>=4.13",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=1.3",
+    "pytest-httpx>=0.36",
+    "coverage>=7.13",
+    "ruff>=0.8",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py314"
+
+[tool.ruff.lint]
+# Default `E,F` plus a small, high-signal set: import sorting (I), bugbear (B),
+# pyupgrade (UP), simplification (SIM), unused-arg (ARG). Style/format checks
+# stay off — this catches real bugs and dead code, not whitespace.
+select = ["E", "F", "I", "B", "UP", "SIM", "ARG"]
+ignore = [
+    "E501",  # line length: enforced via formatter, not lint
+    "B008",  # function call in default arg: common Starlette/httpx idiom
+    "SIM117",  # nested `with` is more readable when one is caplog and one is a streaming connection
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ARG"]  # pytest fixtures often pass through unused params
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_copilot_cli_relay"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

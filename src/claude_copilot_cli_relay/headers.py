@@ -1,0 +1,82 @@
+"""Outbound header construction for the upstream Copilot request."""
+from __future__ import annotations
+
+import uuid
+from collections.abc import Mapping
+
+_STRIP_HEADERS = frozenset(
+    h.lower()
+    for h in (
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "content-length",
+        "authorization",
+        "x-api-key",
+        "user-agent",
+        # Defensive: never forward client-supplied cookies upstream. Claude Code
+        # doesn't send them, but anything else hitting the loopback port might.
+        "cookie",
+    )
+)
+
+# Beta header tokens Copilot's /v1/messages does NOT accept.
+# Claude Code may send these unconditionally; strip them so requests don't 400.
+# Stored lowercased; comparisons must lowercase the inbound token too —
+# otherwise a mixed-case `Context-1M-2025-08-07` would slip past the strip
+# and reach upstream (which rejects it on every model id).
+UNSUPPORTED_BETA_TOKENS = frozenset({
+    "context-1m-2025-08-07",
+})
+
+
+def _filter_anthropic_beta(value: str) -> str | None:
+    tokens = [t.strip() for t in value.split(",") if t.strip()]
+    kept = [t for t in tokens if t.lower() not in UNSUPPORTED_BETA_TOKENS]
+    return ", ".join(kept) if kept else None
+
+
+def build_outbound_headers(
+    inbound: Mapping[str, str],
+    *,
+    bearer_token: str,
+    integration_id: str,
+    editor_version: str,
+    request_id: str | None = None,
+) -> dict[str, str]:
+    # RFC 7230 §6.1: the Connection header lists per-hop header names that
+    # must also be stripped on this hop. Compute that dynamic strip set first.
+    dynamic_strip: set[str] = set()
+    for name, value in inbound.items():
+        if name.lower() == "connection":
+            dynamic_strip.update(t.strip().lower() for t in value.split(",") if t.strip())
+
+    out: dict[str, str] = {}
+    for name, value in inbound.items():
+        lname = name.lower()
+        if lname in _STRIP_HEADERS or lname in dynamic_strip:
+            continue
+        if lname == "anthropic-beta":
+            filtered = _filter_anthropic_beta(value)
+            if filtered:
+                out[name] = filtered
+            continue
+        out[name] = value
+
+    out["Authorization"] = f"Bearer {bearer_token}"
+    out["Copilot-Integration-Id"] = integration_id
+    out["Editor-Version"] = editor_version
+    out["User-Agent"] = editor_version
+    out["X-Request-Id"] = request_id or str(uuid.uuid4())
+
+    # Use case-insensitive presence check — inbound dicts may carry mixed case.
+    if not any(k.lower() == "anthropic-version" for k in out):
+        out["anthropic-version"] = "2023-06-01"
+    return out
