@@ -50,6 +50,17 @@ def test_anthropic_beta_filter_drops_header_when_empty_after_filter():
     assert _filter_anthropic_beta("") is None
 
 
+def test_anthropic_beta_filter_strips_advisor_tool():
+    """Regression: Claude Code sends `advisor-tool-2026-03-01` and Copilot's
+    /v1/messages 400s on it. Strip it like context-1m-2025-08-07."""
+    assert _filter_anthropic_beta("advisor-tool-2026-03-01") is None
+    assert _filter_anthropic_beta(
+        "advisor-tool-2026-03-01, tools-2024-04-04"
+    ) == "tools-2024-04-04"
+    # Case-insensitive, like the rest of the strip set
+    assert _filter_anthropic_beta("Advisor-Tool-2026-03-01") is None
+
+
 def test_anthropic_beta_filter_case_insensitive_strip():
     """Regression: detection of unsupported beta tokens in proxy.py is
     case-insensitive (`_client_wants_1m_context`), and stripping in

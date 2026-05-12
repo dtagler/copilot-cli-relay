@@ -34,6 +34,9 @@ _STRIP_HEADERS = frozenset(
 # and reach upstream (which rejects it on every model id).
 UNSUPPORTED_BETA_TOKENS = frozenset({
     "context-1m-2025-08-07",
+    # Claude Code sends this on every request; Copilot's /v1/messages rejects it
+    # ("unsupported beta header(s): advisor-tool-2026-03-01"), 400-ing the call.
+    "advisor-tool-2026-03-01",
 })
 
 
