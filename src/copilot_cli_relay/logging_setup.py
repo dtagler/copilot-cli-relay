@@ -91,4 +91,4 @@ def redact_bytes(body: bytes) -> bytes:
         return body
 
 
-logger = logging.getLogger("claude_copilot_cli_relay")
+logger = logging.getLogger("copilot_cli_relay")

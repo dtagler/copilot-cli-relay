@@ -1,10 +1,10 @@
-"""Outbound header construction for the upstream Copilot request."""
+"""Outbound header construction for Claude and Codex upstream Copilot requests."""
 from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
 
-_STRIP_HEADERS = frozenset(
+_CLAUDE_STRIP_HEADERS = frozenset(
     h.lower()
     for h in (
         "connection",
@@ -26,7 +26,6 @@ _STRIP_HEADERS = frozenset(
         "cookie",
     )
 )
-
 # Beta header tokens Copilot's /v1/messages does NOT accept.
 # Claude Code may send these unconditionally; strip them so requests don't 400.
 # Stored lowercased; comparisons must lowercase the inbound token too —
@@ -46,16 +45,7 @@ def _filter_anthropic_beta(value: str) -> str | None:
     return ", ".join(kept) if kept else None
 
 
-def build_outbound_headers(
-    inbound: Mapping[str, str],
-    *,
-    bearer_token: str,
-    integration_id: str,
-    editor_version: str,
-    request_id: str | None = None,
-) -> dict[str, str]:
-    # RFC 7230 §6.1: the Connection header lists per-hop header names that
-    # must also be stripped on this hop. Compute that dynamic strip set first.
+def _strip_claude_inbound_headers(inbound: Mapping[str, str]) -> dict[str, str]:
     dynamic_strip: set[str] = set()
     for name, value in inbound.items():
         if name.lower() == "connection":
@@ -64,8 +54,23 @@ def build_outbound_headers(
     out: dict[str, str] = {}
     for name, value in inbound.items():
         lname = name.lower()
-        if lname in _STRIP_HEADERS or lname in dynamic_strip:
+        if lname in _CLAUDE_STRIP_HEADERS or lname in dynamic_strip:
             continue
+        out[name] = value
+    return out
+
+
+def build_claude_outbound_headers(
+    inbound: Mapping[str, str],
+    *,
+    bearer_token: str,
+    integration_id: str,
+    editor_version: str,
+    request_id: str | None = None,
+) -> dict[str, str]:
+    out = {}
+    for name, value in _strip_claude_inbound_headers(inbound).items():
+        lname = name.lower()
         if lname == "anthropic-beta":
             filtered = _filter_anthropic_beta(value)
             if filtered:
@@ -83,3 +88,39 @@ def build_outbound_headers(
     if not any(k.lower() == "anthropic-version" for k in out):
         out["anthropic-version"] = "2023-06-01"
     return out
+
+
+def build_codex_outbound_headers(
+    inbound: Mapping[str, str],
+    *,
+    bearer_token: str,
+    integration_id: str,
+    editor_version: str,
+    plugin_version: str,
+    user_agent: str,
+    github_api_version: str,
+    session_id: str,
+    machine_id: str,
+    request_id: str | None = None,
+    initiator: str = "agent",
+    accept: str = "application/json",
+) -> dict[str, str]:
+    # Rebuild from scratch; no client auth/session state should ride to Copilot.
+    _ = inbound
+    return {
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/json",
+        "Accept": accept,
+        "Copilot-Integration-Id": integration_id,
+        "Editor-Version": editor_version,
+        "Editor-Plugin-Version": plugin_version,
+        "User-Agent": user_agent,
+        "OpenAI-Intent": "conversation-panel",
+        "X-Interaction-Type": "conversation-panel",
+        "X-GitHub-Api-Version": github_api_version,
+        "X-VSCode-User-Agent-Library-Version": "electron-fetch",
+        "VScode-SessionId": session_id,
+        "VScode-MachineId": machine_id,
+        "X-Initiator": initiator,
+        "X-Request-Id": request_id or str(uuid.uuid4()),
+    }

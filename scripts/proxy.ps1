@@ -1,10 +1,11 @@
 <#
 .SYNOPSIS
-  Interactive menu for managing the claude-copilot-cli-relay Docker container.
+  Interactive menu for managing the copilot-cli-relay Docker container.
 
 .DESCRIPTION
   Run with no arguments. Pick an action from the numbered list and the script
-  performs it then exits. For scripted/CI use, prefer plain `docker compose`.
+  performs it then exits. Includes explicit Claude and Codex route checks.
+  For scripted/CI use, prefer plain `docker compose`.
 #>
 #requires -Version 7
 [CmdletBinding()]
@@ -14,13 +15,77 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
+function Get-ItemCount {
+  param([object]$Value)
+
+  if ($null -eq $Value) {
+    return 0
+  }
+  if ($Value -is [array]) {
+    return $Value.Count
+  }
+  return 1
+}
+
+function Test-RelayNamespace {
+  param(
+    [Parameter(Mandatory)]
+    [string]$Name,
+
+    [Parameter(Mandatory)]
+    [string]$HealthUrl,
+
+    [Parameter(Mandatory)]
+    [string]$ModelsUrl,
+
+    [switch]$HasCodexCatalog
+  )
+
+  Write-Host "$Name health: GET $HealthUrl" -ForegroundColor Cyan
+  try {
+    $health = Invoke-RestMethod -Uri $HealthUrl -TimeoutSec 5
+    $health | ConvertTo-Json -Compress
+    if (-not $health.upstream_ok) {
+      Write-Host "WARNING: $Name upstream_ok=false. Token may be stale; run 'pwsh scripts\extract-token.ps1' then restart." -ForegroundColor Yellow
+      exit 1
+    }
+  } catch {
+    Write-Host "$Name health check failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Is the container running? Pick option 'start' next time." -ForegroundColor Yellow
+    exit 1
+  }
+
+  Write-Host "$Name models: GET $ModelsUrl" -ForegroundColor Cyan
+  try {
+    $models = Invoke-RestMethod -Uri $ModelsUrl -TimeoutSec 5
+    $dataCount = Get-ItemCount $models.data
+    if ($dataCount -lt 1) {
+      throw "$Name model catalog returned zero data entries"
+    }
+    if ($HasCodexCatalog) {
+      $catalogCount = Get-ItemCount $models.models
+      if ($catalogCount -lt 1) {
+        throw "$Name Codex model catalog returned zero models entries"
+      }
+      Write-Host "$Name model catalog reachable: data=$dataCount models=$catalogCount" -ForegroundColor Green
+    } else {
+      Write-Host "$Name model catalog reachable: data=$dataCount" -ForegroundColor Green
+    }
+  } catch {
+    Write-Host "$Name model catalog check failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Is the container running? Pick option 'start' next time." -ForegroundColor Yellow
+    exit 1
+  }
+}
+
 $actions = @(
   @{ Key = 'start';   Desc = 'Start container (build only if image missing)' }
   @{ Key = 'stop';    Desc = 'Stop and remove container + network' }
   @{ Key = 'restart'; Desc = 'Restart to pick up src/ edits (starts if down)' }
   @{ Key = 'status';  Desc = 'Show container status + port bind' }
   @{ Key = 'rebuild'; Desc = 'Rebuild image and recreate container' }
-  @{ Key = 'health';  Desc = 'GET /healthz on localhost:4141' }
+  @{ Key = 'claude';  Desc = 'Check Claude routes: /claude/healthz + /claude/v1/models' }
+  @{ Key = 'codex';   Desc = 'Check Codex routes: /codex/healthz + /codex/v1/models' }
   @{ Key = 'quit';    Desc = 'Exit without doing anything' }
 )
 
@@ -31,7 +96,7 @@ try {
     Write-Host ''
   }
 
-  Write-Host 'claude-copilot-cli-relay — pick an action:' -ForegroundColor Cyan
+  Write-Host 'copilot-cli-relay - pick an action:' -ForegroundColor Cyan
   for ($i = 0; $i -lt $actions.Count; $i++) {
     $n = $i + 1
     $a = $actions[$i]
@@ -41,12 +106,12 @@ try {
 
   $choice = Read-Host "Enter choice (1-$($actions.Count))"
   if (-not ($choice -match '^\d+$')) {
-    Write-Host "Not a number — aborting." -ForegroundColor Red
+    Write-Host "Not a number - aborting." -ForegroundColor Red
     exit 1
   }
   $idx = [int]$choice - 1
   if ($idx -lt 0 -or $idx -ge $actions.Count) {
-    Write-Host "Out of range — aborting." -ForegroundColor Red
+    Write-Host "Out of range - aborting." -ForegroundColor Red
     exit 1
   }
   $action = $actions[$idx].Key
@@ -68,7 +133,7 @@ try {
     'restart' {
       $running = (docker compose ps -q proxy 2>$null | Measure-Object).Count
       if ($running -eq 0) {
-        Write-Host "Container not running — starting fresh..." -ForegroundColor Cyan
+        Write-Host "Container not running - starting fresh..." -ForegroundColor Cyan
         docker compose up -d proxy
       } else {
         Write-Host "Restarting proxy (picks up src/ edits)..." -ForegroundColor Cyan
@@ -88,21 +153,19 @@ try {
       docker compose ps proxy
     }
 
-    'health' {
-      $url = 'http://localhost:4141/healthz'
-      Write-Host "GET $url" -ForegroundColor Cyan
-      try {
-        $resp = Invoke-RestMethod -Uri $url -TimeoutSec 5
-        $resp | ConvertTo-Json -Compress
-        if (-not $resp.upstream_ok) {
-          Write-Host "WARNING: upstream_ok=false. Token may be stale; run 'pwsh scripts\extract-token.ps1' then restart." -ForegroundColor Yellow
-          exit 1
-        }
-      } catch {
-        Write-Host "Health check failed: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "Is the container running? Pick option 'start' next time." -ForegroundColor Yellow
-        exit 1
-      }
+    'claude' {
+      Test-RelayNamespace `
+        -Name 'Claude' `
+        -HealthUrl 'http://127.0.0.1:4141/claude/healthz' `
+        -ModelsUrl 'http://127.0.0.1:4141/claude/v1/models'
+    }
+
+    'codex' {
+      Test-RelayNamespace `
+        -Name 'Codex' `
+        -HealthUrl 'http://127.0.0.1:4141/codex/healthz' `
+        -ModelsUrl 'http://127.0.0.1:4141/codex/v1/models' `
+        -HasCodexCatalog
     }
 
     'quit' {

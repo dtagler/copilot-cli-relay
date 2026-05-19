@@ -1,4 +1,4 @@
-"""Reverse-proxy core for /v1/messages and /v1/models."""
+"""Claude/Anthropic route handlers for /claude/v1 client routes."""
 from __future__ import annotations
 
 import json
@@ -8,21 +8,25 @@ import uuid
 from collections.abc import Mapping
 from typing import Any
 
-import anyio
 import httpx
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from .config import get_settings
-from .errors import json_error, sse_error_event
-from .headers import build_outbound_headers
+from .errors import anthropic_json_error, anthropic_sse_error_event
+from .headers import build_claude_outbound_headers
 from .logging_setup import logger, redact_bytes, redact_text
+from .proxy_shared import (
+    MAX_UPSTREAM_ERROR_BYTES,
+    UPSTREAM_TIMEOUT,
+    chunks_with_keepalive,
+    filter_response_headers,
+    passthrough_response,
+    read_bounded,
+)
 
-PING_INTERVAL_SECS = 15.0
-UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0)
 
-
-def _parse_request(body: bytes) -> tuple[bytes, str | None, bool]:
+def _parse_claude_request(body: bytes) -> tuple[bytes, str | None, bool]:
     """Parse the request body once and return (rewritten_body, model, streaming).
 
     Falls back to (body, None, False) on malformed input — we still forward to
@@ -46,7 +50,7 @@ def _parse_request(body: bytes) -> tuple[bytes, str | None, bool]:
     return (new_body if mutated else body), parsed.get("model"), streaming
 
 
-def _kind_for_status(status: int) -> str:
+def _anthropic_kind_for_status(status: int) -> str:
     if status == 401:
         return "authentication_error"
     if status == 403:
@@ -58,31 +62,6 @@ def _kind_for_status(status: int) -> str:
     if 500 <= status < 600:
         return "api_error"
     return "invalid_request_error"
-
-
-# RFC 7230 §6.1 hop-by-hop headers (lowercased) — must be stripped from any
-# response we forward to the client. Also drop framing headers httpx will
-# recompute (content-length, content-encoding, transfer-encoding).
-_HOP_BY_HOP_RESPONSE_HEADERS = frozenset({
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-    "content-encoding",
-    "content-length",
-    # Defensive: don't relay upstream cookies to the local client. Same-trust-
-    # boundary loopback path so this is hygiene, not a real cross-boundary leak.
-    "set-cookie",
-    # Drop the upstream `Server` advertisement — minor info disclosure
-    # (specific upstream stack/version), no value to the client.
-    "server",
-})
-
 
 # Per-model reasoning-effort constraints discovered empirically from upstream 400s.
 # Models NOT listed accept the standard {low, medium, high}.
@@ -249,7 +228,7 @@ def _remap_to_1m(body: bytes, model_id: str | None) -> tuple[bytes, str | None, 
 def _normalize_model_for_upstream(body: bytes, model_id: str | None) -> tuple[bytes, str | None, bool]:
     """Apply the dash→dot conversion required for any -1m / -1m-internal id.
 
-    `/v1/models` advertises ids in canonical Anthropic dash form because
+    `/claude/v1/models` advertises ids in canonical Anthropic dash form because
     Claude Code's `/model` slash command validates against that form. But
     Copilot's `/v1/messages` rejects the dash form for `-1m` ids
     ("model_not_supported") and only accepts the dot form. We do this as
@@ -291,12 +270,12 @@ def _to_upstream_dot_form(model_id: str) -> str | None:
     return f"{m.group(1)}{m.group(2)}.{m.group(3)}{m.group(4)}"
 
 
-async def proxy_messages(request: Request) -> Response:
+async def proxy_claude_messages(request: Request) -> Response:
     settings = get_settings()
     client: httpx.AsyncClient = request.app.state.http_client
 
     raw_body = await request.body()
-    body, model_id, streaming = _parse_request(raw_body)
+    body, model_id, streaming = _parse_claude_request(raw_body)
     if _client_wants_1m_context(request.headers):
         body, new_model_id, remapped = _remap_to_1m(body, model_id)
         if remapped:
@@ -306,13 +285,13 @@ async def proxy_messages(request: Request) -> Response:
             )
             model_id = new_model_id
     # Last hop before upstream: convert -1m ids from the dash form Claude Code
-    # uses (and we advertise in /v1/models) to the dot form Copilot requires.
+    # uses (and we advertise in /claude/v1/models) to the dot form Copilot requires.
     body, model_id, _ = _normalize_model_for_upstream(body, model_id)
     request_id = str(uuid.uuid4())
     model = model_id or "?"
     started = time.monotonic()
 
-    headers = build_outbound_headers(
+    headers = build_claude_outbound_headers(
         request.headers,
         bearer_token=settings.github_token,
         integration_id=settings.integration_id,
@@ -321,7 +300,7 @@ async def proxy_messages(request: Request) -> Response:
     )
     if settings.log_bodies:
         logger.debug(
-            "→ POST /v1/messages model=%s body=%s",
+            "Claude POST /claude/v1/messages -> upstream /v1/messages model=%s body=%s",
             model,
             redact_bytes(body).decode("utf-8", "replace"),
         )
@@ -331,7 +310,7 @@ async def proxy_messages(request: Request) -> Response:
     if not streaming:
         # Use stream=True so we can peek the status before the entire body is
         # buffered. For 2xx we then read the full body for passthrough; for
-        # ≥400 we cap the read at _MAX_UPSTREAM_ERROR_BYTES so a hostile or
+        # >=400 we cap the read at MAX_UPSTREAM_ERROR_BYTES so a hostile or
         # misconfigured upstream can't push us into unbounded memory use.
         req = client.build_request(
             "POST", upstream_url, content=body, headers=headers, timeout=UPSTREAM_TIMEOUT
@@ -340,17 +319,17 @@ async def proxy_messages(request: Request) -> Response:
             resp = await client.send(req, stream=True)
         except httpx.TimeoutException as exc:
             logger.warning("upstream timeout request_id=%s err=%s", request_id, redact_text(str(exc)))
-            return json_error("api_error", f"Upstream timeout: {redact_text(str(exc))}")
+            return anthropic_json_error("api_error", f"Upstream timeout: {redact_text(str(exc))}")
         except httpx.HTTPError as exc:
             logger.warning("upstream error request_id=%s err=%s", request_id, redact_text(str(exc)))
-            return json_error("api_error", f"Upstream error: {redact_text(str(exc))}")
+            return anthropic_json_error("api_error", f"Upstream error: {redact_text(str(exc))}")
 
         try:
             if resp.status_code >= 400:
                 upstream_status = resp.status_code
                 upstream_headers = resp.headers
                 try:
-                    err_bytes = await _read_bounded(resp, _MAX_UPSTREAM_ERROR_BYTES)
+                    err_bytes = await read_bounded(resp, MAX_UPSTREAM_ERROR_BYTES)
                 except Exception as exc:
                     logger.warning(
                         "upstream %d on non-stream request_id=%s; failed to read error body: %s",
@@ -359,23 +338,36 @@ async def proxy_messages(request: Request) -> Response:
                     err_bytes = b""
                 duration_ms = int((time.monotonic() - started) * 1000)
                 logger.info(
-                    "POST /v1/messages model=%s status=%d duration_ms=%d request_id=%s stream=0",
+                    "Claude POST /claude/v1/messages -> upstream /v1/messages model=%s status=%d duration_ms=%d request_id=%s stream=0",
                     model, upstream_status, duration_ms, request_id,
                 )
                 return _build_non_streaming_error(
                     upstream_status, upstream_headers, err_bytes, request_id
                 )
             # Success: read the full body for passthrough.
-            await resp.aread()
+            try:
+                await resp.aread()
+            except httpx.TimeoutException as exc:
+                safe = redact_text(str(exc))
+                logger.warning("upstream read timeout request_id=%s err=%s", request_id, safe)
+                return anthropic_json_error("api_error", f"Upstream timeout: {safe}")
+            except httpx.HTTPError as exc:
+                safe = redact_text(str(exc))
+                logger.warning("upstream read error request_id=%s err=%s", request_id, safe)
+                return anthropic_json_error("api_error", f"Upstream error: {safe}")
+            except Exception as exc:
+                safe = redact_text(str(exc))
+                logger.warning("upstream read error request_id=%s err=%s", request_id, safe)
+                return anthropic_json_error("api_error", f"Upstream error: {safe}")
         finally:
             await resp.aclose()
 
         duration_ms = int((time.monotonic() - started) * 1000)
         logger.info(
-            "POST /v1/messages model=%s status=%d duration_ms=%d request_id=%s stream=0",
+            "Claude POST /claude/v1/messages -> upstream /v1/messages model=%s status=%d duration_ms=%d request_id=%s stream=0",
             model, resp.status_code, duration_ms, request_id,
         )
-        return _passthrough_response(resp)
+        return passthrough_response(resp)
 
     return await _stream_response(
         client=client, url=upstream_url, body=body, headers=headers,
@@ -391,8 +383,8 @@ def _build_non_streaming_error(
 ) -> Response:
     """Wrap a bounded upstream error body in an Anthropic JSON envelope.
 
-    `err_bytes` is already capped at _MAX_UPSTREAM_ERROR_BYTES by the caller's
-    `_read_bounded` so this function only handles redaction, header forwarding,
+    `err_bytes` is already capped at MAX_UPSTREAM_ERROR_BYTES by the caller's
+    `read_bounded` so this function only handles redaction, header forwarding,
     and envelope construction. Without the bound + redaction, a hostile or
     misconfigured upstream could (a) push the proxy into unbounded memory use
     via a giant error body and (b) reflect injected request headers — the
@@ -421,75 +413,12 @@ def _build_non_streaming_error(
         if redacted
         else f"Upstream {status} (error body unavailable)"
     )
-    return json_error(
-        _kind_for_status(status),
+    return anthropic_json_error(
+        _anthropic_kind_for_status(status),
         msg,
         status=status,
         headers=forwarded_headers or None,
     )
-
-
-def _filter_response_headers(
-    headers: httpx.Headers,
-    also_drop: set[str] | None = None,
-) -> dict[str, str]:
-    """Filter upstream response headers down to what's safe to forward.
-
-    Strips RFC 7230 §6.1 hop-by-hop headers (static set + names listed in the
-    upstream `Connection` header), plus any extra names in `also_drop`. Used
-    by both _passthrough_response (non-streaming) and _stream_response to
-    keep the strip rules in one place.
-    """
-    dynamic_strip: set[str] = set()
-    conn_value = headers.get("connection")
-    if conn_value:
-        dynamic_strip.update(t.strip().lower() for t in conn_value.split(",") if t.strip())
-    extra = {n.lower() for n in (also_drop or set())}
-
-    out: dict[str, str] = {}
-    for k, v in headers.items():
-        lk = k.lower()
-        if lk in _HOP_BY_HOP_RESPONSE_HEADERS or lk in dynamic_strip or lk in extra:
-            continue
-        out[k] = v
-    return out
-
-
-def _passthrough_response(resp: httpx.Response) -> Response:
-    # Compute dynamic hop-by-hop strip set from the upstream Connection header
-    # (RFC 7230 §6.1) so per-hop headers it names don't leak past us.
-    dynamic_strip: set[str] = set()
-    conn_value = resp.headers.get("connection")
-    if conn_value:
-        dynamic_strip.update(t.strip().lower() for t in conn_value.split(",") if t.strip())
-
-    # Preserve repeated header values (e.g. Vary, Link, WWW-Authenticate) by
-    # iterating the raw header list instead of dict-collapsing via .items().
-    raw_headers: list[tuple[bytes, bytes]] = []
-    for k, v in resp.headers.raw:
-        lname = k.decode("latin-1").lower()
-        if lname in _HOP_BY_HOP_RESPONSE_HEADERS or lname in dynamic_strip:
-            continue
-        raw_headers.append((k.lower(), v))
-    # Replace upstream content-length with our own since we re-buffer the body.
-    raw_headers.append((b"content-length", str(len(resp.content)).encode("latin-1")))
-    out = Response(content=resp.content, status_code=resp.status_code)
-    out.raw_headers = raw_headers
-    return out
-
-
-# Cap on how many bytes of an upstream error body we read before returning the
-# JSON envelope. Bounds memory under hostile/misbehaving upstreams.
-_MAX_UPSTREAM_ERROR_BYTES = 32 * 1024
-
-
-async def _read_bounded(resp: httpx.Response, max_bytes: int) -> bytes:
-    buf = bytearray()
-    async for chunk in resp.aiter_bytes():
-        buf.extend(chunk)
-        if len(buf) >= max_bytes:
-            return bytes(buf[:max_bytes])
-    return bytes(buf)
 
 
 async def _stream_response(
@@ -517,14 +446,14 @@ async def _stream_response(
     except httpx.TimeoutException as exc:
         safe = redact_text(str(exc))
         logger.warning("upstream stream timeout request_id=%s err=%s", request_id, safe)
-        return json_error("api_error", f"Upstream timeout: {safe}")
+        return anthropic_json_error("api_error", f"Upstream timeout: {safe}")
     except Exception as exc:
         # Catch broadly so non-httpx errors raised by the transport (OSError,
         # ssl.SSLError, etc.) still become a clean Anthropic-shaped envelope
         # rather than a 500 from the Starlette default handler.
         safe = redact_text(str(exc))
         logger.warning("upstream stream connect error request_id=%s err=%s", request_id, safe)
-        return json_error("api_error", f"Upstream stream error: {safe}")
+        return anthropic_json_error("api_error", f"Upstream stream error: {safe}")
 
     if upstream.status_code >= 400:
         upstream_status = upstream.status_code
@@ -538,7 +467,7 @@ async def _stream_response(
                 forwarded_headers[k] = v
         try:
             try:
-                err_bytes = await _read_bounded(upstream, _MAX_UPSTREAM_ERROR_BYTES)
+                err_bytes = await read_bounded(upstream, MAX_UPSTREAM_ERROR_BYTES)
             except Exception as exc:
                 # The error-body stream itself can fail (httpx.ReadError, OSError,
                 # etc.). Don't let that escape — we still know the upstream
@@ -568,8 +497,8 @@ async def _stream_response(
             if redacted
             else f"Upstream {upstream_status} (error body unavailable)"
         )
-        return json_error(
-            _kind_for_status(upstream_status),
+        return anthropic_json_error(
+            _anthropic_kind_for_status(upstream_status),
             msg,
             status=upstream_status,
             headers=forwarded_headers or None,
@@ -577,13 +506,13 @@ async def _stream_response(
 
     ttfb = int((time.monotonic() - started) * 1000)
     logger.info(
-        "POST /v1/messages model=%s status=%d ttfb_ms=%d request_id=%s stream=1",
+        "Claude POST /claude/v1/messages -> upstream /v1/messages model=%s status=%d ttfb_ms=%d request_id=%s stream=1",
         model, upstream.status_code, ttfb, request_id,
     )
 
     async def body_iter():
         try:
-            async for chunk, sentinel in _chunks_with_keepalive(upstream, request):
+            async for chunk, sentinel in chunks_with_keepalive(upstream, request):
                 if sentinel == "disconnect":
                     return
                 if sentinel == "ping":
@@ -591,7 +520,7 @@ async def _stream_response(
                     continue
                 yield chunk
         except Exception as exc:
-            # Catch broadly: the producer in _chunks_with_keepalive captures
+            # Catch broadly: the producer in chunks_with_keepalive captures
             # any non-cancellation Exception (OSError, ssl.SSLError,
             # anyio.BrokenResourceError, etc.) and re-raises it here. An
             # uncaught one would silently truncate the SSE stream — exactly
@@ -600,15 +529,15 @@ async def _stream_response(
             # propagates correctly.
             safe = redact_text(str(exc))
             logger.warning("stream error request_id=%s err=%s", request_id, safe)
-            yield sse_error_event("api_error", f"Upstream stream error: {safe}")
+            yield anthropic_sse_error_event("api_error", f"Upstream stream error: {safe}")
         finally:
             await upstream.aclose()
 
     # Forward upstream response headers (request-id correlation, vendor
     # rate-limit hints, etc.) on the streaming success path the same way
-    # _passthrough_response does for non-streaming, less hop-by-hop and our
+    # passthrough_response does for non-streaming, less hop-by-hop and our
     # own framing/content-type.
-    response_headers = _filter_response_headers(
+    response_headers = filter_response_headers(
         upstream.headers,
         also_drop={"content-type", "content-length", "content-encoding"},
     )
@@ -621,68 +550,10 @@ async def _stream_response(
         headers=response_headers,
     )
 
-
-async def _chunks_with_keepalive(upstream: httpx.Response, request: Request):
-    """Yield (chunk, sentinel) tuples from upstream, multiplexed with ping/disconnect.
-
-    A background producer task copies bytes from `upstream.aiter_bytes()` into
-    a bounded memory channel; the consumer loop selects between channel reads
-    (with a ping timeout) and the disconnect poll. This keeps the ping timeout
-    from cancelling the upstream read — which would otherwise finalize the
-    httpx async generator and silently truncate the stream after the first
-    quiet interval >= PING_INTERVAL_SECS.
-
-    Note: uses `aiter_bytes()` (not `aiter_raw()`) so any upstream
-    `Content-Encoding` (gzip/br/deflate) is transparently decoded by httpx.
-    `aiter_raw()` would forward still-compressed bytes to the client with a
-    `text/event-stream` content-type, silently corrupting the stream.
-    """
-    send, recv = anyio.create_memory_object_stream(max_buffer_size=8)
-    producer_error: list[BaseException] = []
-
-    async def _producer() -> None:
-        try:
-            async for raw in upstream.aiter_bytes():
-                await send.send(raw)
-        except anyio.get_cancelled_exc_class():
-            raise
-        except Exception as exc:  # captured for re-raise after channel drains
-            logger.warning("upstream stream pump error: %s", redact_text(str(exc)))
-            producer_error.append(exc)
-        finally:
-            await send.aclose()
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(_producer)
-        try:
-            while True:
-                if await request.is_disconnected():
-                    yield b"", "disconnect"
-                    tg.cancel_scope.cancel()
-                    return
-                with anyio.move_on_after(PING_INTERVAL_SECS) as scope:
-                    try:
-                        chunk = await recv.receive()
-                    except anyio.EndOfStream:
-                        # Producer finished (clean EOF or error). Break out of
-                        # the task group so we can re-raise without wrapping
-                        # the exception in an ExceptionGroup.
-                        break
-                if scope.cancel_called:
-                    yield b"", "ping"
-                    continue
-                yield chunk, None
-        finally:
-            await recv.aclose()
-
-    if producer_error:
-        raise producer_error[0]
-
-
-async def proxy_models(request: Request) -> Response:
+async def proxy_claude_models(request: Request) -> Response:
     settings = get_settings()
     client: httpx.AsyncClient = request.app.state.http_client
-    headers = build_outbound_headers(
+    headers = build_claude_outbound_headers(
         {},
         bearer_token=settings.github_token,
         integration_id=settings.integration_id,
@@ -692,10 +563,10 @@ async def proxy_models(request: Request) -> Response:
     try:
         resp = await client.get(f"{settings.api_base}/models", headers=headers, timeout=30.0)
     except httpx.HTTPError as exc:
-        return json_error("api_error", f"Upstream /models error: {redact_text(str(exc))}")
+        return anthropic_json_error("api_error", f"Upstream /models error: {redact_text(str(exc))}")
     if resp.status_code != 200:
-        return json_error(
-            _kind_for_status(resp.status_code),
+        return anthropic_json_error(
+            _anthropic_kind_for_status(resp.status_code),
             f"Upstream /models {resp.status_code}: {redact_text(resp.text)[:300]}",
             status=resp.status_code,
         )
@@ -703,7 +574,7 @@ async def proxy_models(request: Request) -> Response:
         payload = resp.json()
     except ValueError as exc:
         logger.warning("upstream /models 200 with non-JSON body: %s", exc)
-        return json_error(
+        return anthropic_json_error(
             "api_error",
             f"Upstream /models returned non-JSON body: {redact_text(resp.text)[:200]}",
         )
@@ -736,7 +607,7 @@ async def proxy_models(request: Request) -> Response:
         # would make `/model claude-opus-4-7-1m-internal` fail at the picker
         # layer and force users back to the silently-downgrading 200K path.
         # Claude Code's auto-attached `context-1m-2025-08-07` beta header is
-        # still rejected by Copilot, but headers.py strips it (and proxy_messages
+        # still rejected by Copilot, but headers.py strips it (and proxy_claude_messages
         # remaps the model id when the beta is present, see _remap_to_1m).
         if "internal only" in name.lower() and not (mid.endswith("-1m") or mid.endswith("-1m-internal")):
             continue
@@ -771,7 +642,7 @@ def _is_anthropic(model: object) -> bool:
     return isinstance(model, dict) and (model.get("vendor") or "").lower() == "anthropic"
 
 
-async def healthz(request: Request) -> Response:
+async def claude_healthz(request: Request) -> Response:
     settings = get_settings()
     client: httpx.AsyncClient = request.app.state.http_client
     model_count = 0
@@ -781,7 +652,7 @@ async def healthz(request: Request) -> Response:
     try:
         resp = await client.get(
             f"{settings.api_base}/models",
-            headers=build_outbound_headers(
+            headers=build_claude_outbound_headers(
                 {},
                 bearer_token=settings.github_token,
                 integration_id=settings.integration_id,
@@ -794,7 +665,7 @@ async def healthz(request: Request) -> Response:
             try:
                 payload = resp.json()
             except ValueError as exc:
-                logger.warning("healthz upstream 200 with non-JSON body: %s", exc)
+                logger.warning("claude_healthz upstream 200 with non-JSON body: %s", exc)
             else:
                 upstream_ok = True
                 data = payload.get("data", []) if isinstance(payload, dict) else []
@@ -802,7 +673,7 @@ async def healthz(request: Request) -> Response:
         elif resp.status_code in (401, 403):
             hint = "token may be expired; re-run scripts/extract-token.ps1 then docker compose restart proxy"
     except Exception as exc:
-        logger.warning("healthz upstream check failed: %s", redact_text(str(exc)))
+        logger.warning("claude_healthz upstream check failed: %s", redact_text(str(exc)))
     body = {
         "ok": True,
         "upstream_ok": upstream_ok,

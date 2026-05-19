@@ -1,8 +1,10 @@
+name: copilot-cli-relay
+
 services:
   proxy:
     build: .
-    image: claude-copilot-cli-relay:dev
-    container_name: claude-copilot-cli-relay
+    image: copilot-cli-relay:dev
+    container_name: copilot-cli-relay
     env_file:
       - .env
     ports:
@@ -15,7 +17,7 @@ services:
       # handled by `restart: unless-stopped` below — Compose itself doesn't
       # restart unhealthy containers, but the healthcheck makes the state
       # visible in `docker compose ps` and to any external orchestrator.
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4141/healthz', timeout=3).status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4141/claude/healthz', timeout=3).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -1,7 +1,7 @@
 [project]
-name = "claude-copilot-cli-relay"
-version = "0.1.0"
-description = "Reverse proxy that lets Claude Code use a GitHub Copilot Enterprise subscription via Copilot's native Anthropic Messages endpoint."
+name = "copilot-cli-relay"
+version = "0.2.0"
+description = "Reverse proxy that lets Claude Code and Codex CLI use GitHub Copilot Enterprise through Copilot's native protocol endpoints."
 requires-python = ">=3.14"
 dependencies = [
     "starlette>=1.0",
@@ -42,7 +42,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/claude_copilot_cli_relay"]
+packages = ["src/copilot_cli_relay"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

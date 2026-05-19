@@ -1,4 +1,4 @@
-"""Tests for proxy.py — handlers, streaming, model filtering, healthz."""
+"""Tests for Claude handlers, shared streaming helpers, model filtering, and health."""
 from __future__ import annotations
 
 import asyncio
@@ -10,17 +10,18 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-import claude_copilot_cli_relay.proxy as proxy_mod
-from claude_copilot_cli_relay.config import Settings, reset_settings_for_tests
-from claude_copilot_cli_relay.proxy import (
-    _kind_for_status,
+import copilot_cli_relay.claude_proxy as claude_proxy_mod
+import copilot_cli_relay.proxy_shared as proxy_shared_mod
+from copilot_cli_relay.claude_proxy import (
+    _anthropic_kind_for_status,
     _normalize_effort,
-    _parse_request,
-    _passthrough_response,
-    healthz,
-    proxy_messages,
-    proxy_models,
+    _parse_claude_request,
+    claude_healthz,
+    proxy_claude_messages,
+    proxy_claude_models,
 )
+from copilot_cli_relay.config import Settings, reset_settings_for_tests
+from copilot_cli_relay.proxy_shared import passthrough_response
 
 
 @pytest.fixture(autouse=True)
@@ -30,7 +31,7 @@ def _settings():
         github_token="gho_test",
         api_base="https://upstream.test",
         integration_id="copilot-developer-cli",
-        editor_version="claude-copilot-cli-relay/test",
+        editor_version="copilot-cli-relay/test",
         log_level="info",
         log_bodies=True,  # exercise body-logging code path
     )
@@ -43,9 +44,10 @@ def _make_client(handler):
     """Build app with proxy routes and inject httpx.AsyncClient using MockTransport."""
     app = Starlette(
         routes=[
-            Route("/v1/messages", proxy_messages, methods=["POST"]),
-            Route("/v1/models", proxy_models, methods=["GET"]),
-            Route("/healthz", healthz, methods=["GET"]),
+            Route("/claude/v1/messages", proxy_claude_messages, methods=["POST"]),
+            Route("/claude/v1/models", proxy_claude_models, methods=["GET"]),
+            Route("/claude/healthz", claude_healthz, methods=["GET"]),
+            Route("/healthz", claude_healthz, methods=["GET"]),
         ],
     )
     transport = httpx.MockTransport(handler)
@@ -53,12 +55,12 @@ def _make_client(handler):
     return TestClient(app), app
 
 
-def test_parse_request_stream_strict_boolean():
+def test_parse_claude_request_stream_strict_boolean():
     """Per Anthropic spec `stream` is a JSON boolean. Truthy non-bool values
     (string "false", int 1, dict {}) must NOT be treated as streaming —
     otherwise the proxy returns the wrong content framing."""
     # True bool → streaming
-    _b, _m, s = _parse_request(b'{"stream": true}')
+    _b, _m, s = _parse_claude_request(b'{"stream": true}')
     assert s is True
     # Anything else → not streaming, even if Python-truthy
     for raw in (
@@ -72,7 +74,7 @@ def test_parse_request_stream_strict_boolean():
         b'{"stream": {}}',
         b'{}',
     ):
-        _b, _m, s = _parse_request(raw)
+        _b, _m, s = _parse_claude_request(raw)
         assert s is False, f"expected non-streaming for {raw!r}"
 
 
@@ -92,40 +94,40 @@ def test_parse_request_stream_strict_boolean():
         (418, "invalid_request_error"),
     ],
 )
-def test_kind_for_status(status, kind):
-    assert _kind_for_status(status) == kind
+def test_anthropic_kind_for_status(status, kind):
+    assert _anthropic_kind_for_status(status) == kind
 
 
-def test_parse_request_stream_and_model_extraction():
-    """_parse_request replaces the old _wants_stream/_model_from_body helpers;
+def test_parse_claude_request_stream_and_model_extraction():
+    """_parse_claude_request replaces the old _wants_stream/_model_from_body helpers;
     confirm the same semantics for streaming flag + model extraction + malformed."""
-    body, model, stream = _parse_request(b'{"stream": true, "model": "claude-x"}')
+    body, model, stream = _parse_claude_request(b'{"stream": true, "model": "claude-x"}')
     assert stream is True and model == "claude-x"
-    body, model, stream = _parse_request(b'{"stream": false, "model": "claude-x"}')
+    body, model, stream = _parse_claude_request(b'{"stream": false, "model": "claude-x"}')
     assert stream is False and model == "claude-x"
-    body, model, stream = _parse_request(b'{}')
+    body, model, stream = _parse_claude_request(b'{}')
     assert stream is False and model is None
-    body, model, stream = _parse_request(b'not json')
+    body, model, stream = _parse_claude_request(b'not json')
     assert stream is False and model is None
     assert body == b'not json'  # malformed bodies forwarded unchanged
 
 
-def test_parse_request_malformed_body_returns_defaults():
-    body, model, streaming = proxy_mod._parse_request(b"not json{{{")
+def test_parse_claude_request_malformed_body_returns_defaults():
+    body, model, streaming = claude_proxy_mod._parse_claude_request(b"not json{{{")
     assert body == b"not json{{{"
     assert model is None
     assert streaming is False
 
 
-def test_parse_request_non_dict_body_returns_defaults():
-    body, model, streaming = proxy_mod._parse_request(b'["a","b"]')
+def test_parse_claude_request_non_dict_body_returns_defaults():
+    body, model, streaming = claude_proxy_mod._parse_claude_request(b'["a","b"]')
     assert body == b'["a","b"]'
     assert model is None
     assert streaming is False
 
 
-def test_parse_request_dict_body_returns_metadata():
-    body, model, streaming = proxy_mod._parse_request(b'{"model":"m","stream":true}')
+def test_parse_claude_request_dict_body_returns_metadata():
+    body, model, streaming = claude_proxy_mod._parse_claude_request(b'{"model":"m","stream":true}')
     assert model == "m"
     assert streaming is True
     # body is re-serialized but semantically equal.
@@ -149,7 +151,7 @@ def test_normalize_effort_alias_and_passthrough():
 
 def test_rewrite_body_drops_non_dict_root():
     raw = b'["not","an","object"]'
-    out, model, stream = proxy_mod._parse_request(raw)
+    out, model, stream = claude_proxy_mod._parse_claude_request(raw)
     assert out == raw
     assert model is None
     assert stream is False
@@ -160,7 +162,7 @@ def test_rewrite_body_strips_empty_output_config_after_haiku_strip():
         "model": "claude-haiku-4.5",
         "output_config": {"effort": "high"},
     }).encode()
-    out, _model, _stream = proxy_mod._parse_request(raw)
+    out, _model, _stream = claude_proxy_mod._parse_claude_request(raw)
     out_obj = json.loads(out)
     assert "output_config" not in out_obj
 
@@ -170,7 +172,7 @@ def test_rewrite_body_keeps_non_empty_output_config():
         "model": "claude-haiku-4.5",
         "output_config": {"effort": "high", "other": 1},
     }).encode()
-    out, _model, _stream = proxy_mod._parse_request(raw)
+    out, _model, _stream = claude_proxy_mod._parse_claude_request(raw)
     out_obj = json.loads(out)
     # effort field stripped, but other remains so output_config stays.
     assert out_obj["output_config"] == {"other": 1}
@@ -191,7 +193,7 @@ def test_passthrough_response_drops_hop_by_hop():
     # Inject content-encoding manually after construction so httpx doesn't try
     # to gzip-decode the literal bytes; we just want to verify it's stripped.
     upstream.headers["content-encoding"] = "gzip"
-    r = _passthrough_response(upstream)
+    r = passthrough_response(upstream)
     assert r.status_code == 201
     assert r.body == b"hello"
     keys = {k.lower() for k in r.headers}
@@ -204,7 +206,7 @@ def test_passthrough_response_drops_hop_by_hop():
 def test_passthrough_response_strips_trailer_singular():
     """RFC 7230 §6.1 lists the hop-by-hop header as `Trailer` (singular)."""
     upstream = httpx.Response(200, content=b"x", headers={"trailer": "expires", "x-keep": "1"})
-    r = _passthrough_response(upstream)
+    r = passthrough_response(upstream)
     keys = {k.lower() for k in r.headers}
     assert "trailer" not in keys
     assert r.headers["x-keep"] == "1"
@@ -222,7 +224,7 @@ def test_passthrough_response_strips_connection_named_dynamic_hop_by_hop():
             "x-keep": "1",
         },
     )
-    r = _passthrough_response(upstream)
+    r = passthrough_response(upstream)
     keys = {k.lower() for k in r.headers}
     assert "x-server-hop" not in keys
     assert "connection" not in keys
@@ -250,7 +252,7 @@ def test_messages_streaming_success_forwards_upstream_headers():
         )
 
     client, _ = _make_client(handler)
-    with client.stream("POST", "/v1/messages", json={"model": "x", "stream": True}) as r:
+    with client.stream("POST", "/claude/v1/messages", json={"model": "x", "stream": True}) as r:
         assert r.status_code == 200
         # Forwarded
         assert r.headers.get("x-request-id") == "upstream-rid-12345"
@@ -266,25 +268,25 @@ def test_messages_streaming_success_forwards_upstream_headers():
         b"".join(r.iter_bytes())
 
 
-def test_parse_request_no_rewrite_returns_original_bytes():
-    """When no effort fields need rewriting, _parse_request must return the
+def test_parse_claude_request_no_rewrite_returns_original_bytes():
+    """When no effort fields need rewriting, _parse_claude_request must return the
     exact original byte sequence (not a re-serialized copy). Avoids
     ensure_ascii expansion of unicode and preserves byte-for-byte shape."""
     # Whitespace + unicode + key ordering that json.dumps would reshape.
     raw = b'{ "model" : "claude-sonnet-4-6",  "messages": [{"content": "h\xc3\xa9llo \xf0\x9f\x98\x80"}] }'
-    out, model, _stream = proxy_mod._parse_request(raw)
+    out, model, _stream = claude_proxy_mod._parse_claude_request(raw)
     assert out is raw  # identity, not just equality
     assert model == "claude-sonnet-4-6"
 
 
-def test_parse_request_rewrite_keeps_unicode_unescaped():
+def test_parse_claude_request_rewrite_keeps_unicode_unescaped():
     """When a rewrite IS required, the re-serialized body must keep unicode
     chars as UTF-8 bytes (ensure_ascii=False), not \\uXXXX escapes."""
     raw = (
         b'{"model":"claude-haiku-4.5","reasoning_effort":"high",'
         b'"messages":[{"content":"caf\xc3\xa9"}]}'
     )
-    out, _model, _stream = proxy_mod._parse_request(raw)
+    out, _model, _stream = claude_proxy_mod._parse_claude_request(raw)
     assert out is not raw  # rewrite happened
     assert b"\xc3\xa9" in out  # raw UTF-8 bytes for é preserved
     assert b"\\u00e9" not in out
@@ -302,7 +304,7 @@ def test_messages_inbound_authorization_never_reaches_upstream():
 
     client, _ = _make_client(handler)
     r = client.post(
-        "/v1/messages",
+        "/claude/v1/messages",
         json={"model": "claude-sonnet-4-6"},
         headers={
             "Authorization": "Bearer LEAKED-CLIENT-TOKEN",
@@ -335,7 +337,7 @@ def test_messages_non_streaming_success():
 
     client, _ = _make_client(handler)
     payload = {"model": "claude-sonnet-4.6", "messages": [{"role": "user", "content": "hi"}]}
-    r = client.post("/v1/messages", json=payload)
+    r = client.post("/claude/v1/messages", json=payload)
     assert r.status_code == 200
     assert r.json()["id"] == "msg_1"
     assert r.headers["x-upstream"] == "ok"
@@ -354,7 +356,7 @@ def test_messages_body_rewrite_applied_before_send():
 
     client, _ = _make_client(handler)
     r = client.post(
-        "/v1/messages",
+        "/claude/v1/messages",
         json={"model": "claude-opus-4.7", "reasoning_effort": "xhigh"},
     )
     assert r.status_code == 200
@@ -379,7 +381,7 @@ def test_messages_non_streaming_error_body_read_failure_still_returns_status(cap
 
     client, _ = _make_client(handler)
     with caplog.at_level("WARNING"):
-        r = client.post("/v1/messages", json={"model": "x"})
+        r = client.post("/claude/v1/messages", json={"model": "x"})
     assert r.status_code == 503
     body = r.json()
     assert body["error"]["type"] == "api_error"
@@ -405,7 +407,7 @@ def test_messages_non_streaming_error_body_redacted_when_log_bodies(caplog):
 
     client, _ = _make_client(handler)
     with caplog.at_level("WARNING"):
-        r = client.post("/v1/messages", json={"model": "x"})
+        r = client.post("/claude/v1/messages", json={"model": "x"})
     assert r.status_code == 500
     body = r.json()
     assert body["error"]["type"] == "api_error"
@@ -421,7 +423,7 @@ def test_messages_non_streaming_error_body_suppressed_when_log_bodies_off(caplog
         proxy_port=4141, github_token="gho_test",
         api_base="https://upstream.test",
         integration_id="copilot-developer-cli",
-        editor_version="claude-copilot-cli-relay/test",
+        editor_version="copilot-cli-relay/test",
         log_level="info", log_bodies=False,
     )
     reset_settings_for_tests(s)
@@ -431,7 +433,7 @@ def test_messages_non_streaming_error_body_suppressed_when_log_bodies_off(caplog
 
         client, _ = _make_client(handler)
         with caplog.at_level("WARNING"):
-            r = client.post("/v1/messages", json={"model": "x"})
+            r = client.post("/claude/v1/messages", json={"model": "x"})
         assert r.status_code == 429
         log_text = "\n".join(rec.message for rec in caplog.records)
         assert "sensitive non-stream details" not in log_text
@@ -456,7 +458,7 @@ def test_messages_non_streaming_error_forwards_retry_after():
         )
 
     client, _ = _make_client(handler)
-    r = client.post("/v1/messages", json={"model": "x"})
+    r = client.post("/claude/v1/messages", json={"model": "x"})
     assert r.status_code == 429
     assert r.headers.get("retry-after") == "30"
     assert r.headers.get("x-ratelimit-remaining") == "0"
@@ -469,7 +471,7 @@ def test_messages_non_streaming_error_status_kind_mapping():
         return httpx.Response(403, content=b"forbidden")
 
     client, _ = _make_client(handler)
-    r = client.post("/v1/messages", json={"model": "x"})
+    r = client.post("/claude/v1/messages", json={"model": "x"})
     assert r.status_code == 403
     assert r.json()["error"]["type"] == "permission_error"
 
@@ -481,7 +483,7 @@ def test_passthrough_response_strips_server_header():
         content=b"x",
         headers={"server": "nginx/1.25.3 (Ubuntu)", "x-keep": "1"},
     )
-    r = _passthrough_response(upstream)
+    r = passthrough_response(upstream)
     keys = {k.lower() for k in r.headers}
     assert "server" not in keys
     assert r.headers["x-keep"] == "1"
@@ -507,7 +509,7 @@ def test_1m_remap_opus_47_with_beta_routes_to_internal_variant():
 
     client, _ = _make_client(handler)
     r = client.post(
-        "/v1/messages",
+        "/claude/v1/messages",
         json={"model": "claude-opus-4-7", "messages": []},
         headers={"anthropic-beta": "context-1m-2025-08-07"},
     )
@@ -527,7 +529,7 @@ def test_1m_remap_opus_46_with_beta_routes_to_1m_variant():
 
     client, _ = _make_client(handler)
     client.post(
-        "/v1/messages",
+        "/claude/v1/messages",
         json={"model": "claude-opus-4.6", "messages": []},
         headers={"anthropic-beta": "context-1m-2025-08-07"},
     )
@@ -545,7 +547,7 @@ def test_1m_remap_dot_form_model_id_also_remapped():
 
     client, _ = _make_client(handler)
     client.post(
-        "/v1/messages",
+        "/claude/v1/messages",
         json={"model": "Claude-Opus-4.7", "messages": []},  # mixed case + dots
         headers={"anthropic-beta": "context-1m-2025-08-07, tools-2024-04-04"},
     )
@@ -553,7 +555,7 @@ def test_1m_remap_dot_form_model_id_also_remapped():
 
 
 def test_1m_remap_mixed_case_beta_token_remaps_AND_strips():
-    """Regression: detection (proxy.py) and stripping (headers.py) of the
+    """Regression: detection (claude_proxy.py) and stripping (headers.py) of the
     1M beta token must agree on case-insensitivity. A mixed-case
     `Context-1M-2025-08-07` should both trigger the model remap AND get
     stripped from the outbound headers — otherwise upstream rejects it."""
@@ -566,7 +568,7 @@ def test_1m_remap_mixed_case_beta_token_remaps_AND_strips():
 
     client, _ = _make_client(handler)
     r = client.post(
-        "/v1/messages",
+        "/claude/v1/messages",
         json={"model": "claude-opus-4-7", "messages": []},
         headers={"anthropic-beta": "Context-1M-2025-08-07"},
     )
@@ -586,7 +588,7 @@ def test_1m_remap_no_beta_means_no_remap():
         return httpx.Response(200, json={"ok": True})
 
     client, _ = _make_client(handler)
-    client.post("/v1/messages", json={"model": "claude-opus-4-7", "messages": []})
+    client.post("/claude/v1/messages", json={"model": "claude-opus-4-7", "messages": []})
     assert captured["body"]["model"] == "claude-opus-4-7"
 
 
@@ -602,7 +604,7 @@ def test_1m_remap_unknown_model_no_op():
 
     client, _ = _make_client(handler)
     client.post(
-        "/v1/messages",
+        "/claude/v1/messages",
         json={"model": "claude-sonnet-4-6", "messages": []},
         headers={"anthropic-beta": "context-1m-2025-08-07"},
     )
@@ -622,7 +624,7 @@ def test_1m_remap_user_already_picked_1m_id_directly():
 
     client, _ = _make_client(handler)
     client.post(
-        "/v1/messages",
+        "/claude/v1/messages",
         json={"model": "claude-opus-4-7-1m-internal", "messages": []},
     )
     # Dash in (from Claude Code), dot out (what Copilot accepts).
@@ -638,7 +640,7 @@ def test_1m_dash_to_dot_normalization_for_opus_46_1m():
         return httpx.Response(200, json={"ok": True})
 
     client, _ = _make_client(handler)
-    client.post("/v1/messages", json={"model": "claude-opus-4-6-1m", "messages": []})
+    client.post("/claude/v1/messages", json={"model": "claude-opus-4-6-1m", "messages": []})
     assert captured["body"]["model"] == "claude-opus-4.6-1m"
 
 
@@ -652,7 +654,7 @@ def test_no_dash_to_dot_normalization_for_non_1m_models():
         return httpx.Response(200, json={"ok": True})
 
     client, _ = _make_client(handler)
-    client.post("/v1/messages", json={"model": "claude-sonnet-4-6", "messages": []})
+    client.post("/claude/v1/messages", json={"model": "claude-sonnet-4-6", "messages": []})
     assert captured["body"]["model"] == "claude-sonnet-4-6"  # unchanged
 
 
@@ -668,13 +670,13 @@ def test_dash_to_dot_normalization_handles_future_1m_variants():
 
     client, _ = _make_client(handler)
     for dashed in ("claude-sonnet-4-6-1m", "claude-haiku-4-5-1m-internal"):
-        client.post("/v1/messages", json={"model": dashed, "messages": []})
+        client.post("/claude/v1/messages", json={"model": dashed, "messages": []})
     assert captured == ["claude-sonnet-4.6-1m", "claude-haiku-4.5-1m-internal"]
 
 
 def test_to_upstream_dot_form_unit():
     """Direct unit coverage of the version-segment dash→dot helper."""
-    f = proxy_mod._to_upstream_dot_form
+    f = claude_proxy_mod._to_upstream_dot_form
     assert f("claude-opus-4-7-1m-internal") == "claude-opus-4.7-1m-internal"
     assert f("claude-opus-4-6-1m") == "claude-opus-4.6-1m"
     # Dot-form input is rejected by the regex (it requires dash-form version
@@ -691,7 +693,7 @@ def test_to_upstream_dot_form_unit():
 def test_normalize_model_for_upstream_defensive_paths():
     """Direct unit coverage of _normalize_model_for_upstream's safety guards
     for non-string inputs and malformed JSON bodies."""
-    f = proxy_mod._normalize_model_for_upstream
+    f = claude_proxy_mod._normalize_model_for_upstream
     # Non-string model_id → no-op
     out, m, mut = f(b'{"model": null}', None)
     assert (out, m, mut) == (b'{"model": null}', None, False)
@@ -705,13 +707,13 @@ def test_remap_to_1m_defensive_paths():
     model_id, malformed JSON body, and non-dict JSON root all return the
     inputs unchanged with mutated=False."""
     # Non-string model_id (e.g. None upstream of a malformed inbound).
-    out, m, mut = proxy_mod._remap_to_1m(b'{"model": null}', None)
+    out, m, mut = claude_proxy_mod._remap_to_1m(b'{"model": null}', None)
     assert (out, m, mut) == (b'{"model": null}', None, False)
-    # Malformed JSON body (shouldn't happen post _parse_request, but defended).
-    out, m, mut = proxy_mod._remap_to_1m(b"not json{{", "claude-opus-4-7")
+    # Malformed JSON body (shouldn't happen post _parse_claude_request, but defended).
+    out, m, mut = claude_proxy_mod._remap_to_1m(b"not json{{", "claude-opus-4-7")
     assert mut is False and m == "claude-opus-4-7"
     # JSON root that isn't a dict.
-    out, m, mut = proxy_mod._remap_to_1m(b'["arr"]', "claude-opus-4-7")
+    out, m, mut = claude_proxy_mod._remap_to_1m(b'["arr"]', "claude-opus-4-7")
     assert mut is False and m == "claude-opus-4-7"
 
 
@@ -720,7 +722,7 @@ def test_messages_non_streaming_timeout():
         raise httpx.ConnectTimeout("timeout!")
 
     client, _ = _make_client(handler)
-    r = client.post("/v1/messages", json={"model": "x"})
+    r = client.post("/claude/v1/messages", json={"model": "x"})
     assert r.status_code == 502
     body = r.json()
     assert body["error"]["type"] == "api_error"
@@ -732,7 +734,7 @@ def test_messages_non_streaming_http_error():
         raise httpx.ConnectError("boom")
 
     client, _ = _make_client(handler)
-    r = client.post("/v1/messages", json={"model": "x"})
+    r = client.post("/claude/v1/messages", json={"model": "x"})
     assert r.status_code == 502
     assert r.json()["error"]["type"] == "api_error"
 
@@ -745,7 +747,7 @@ def test_messages_non_streaming_exception_text_redacted(caplog):
 
     client, _ = _make_client(handler)
     with caplog.at_level("WARNING"):
-        r = client.post("/v1/messages", json={"model": "x"})
+        r = client.post("/claude/v1/messages", json={"model": "x"})
     assert r.status_code == 502
     msg = r.json()["error"]["message"]
     assert "leaked-exc-token-12345" not in msg
@@ -760,7 +762,7 @@ def test_messages_non_streaming_timeout_text_redacted(caplog):
 
     client, _ = _make_client(handler)
     with caplog.at_level("WARNING"):
-        r = client.post("/v1/messages", json={"model": "x"})
+        r = client.post("/claude/v1/messages", json={"model": "x"})
     assert r.status_code == 502
     msg = r.json()["error"]["message"]
     assert "leaked-timeout-token-77777" not in msg
@@ -768,12 +770,84 @@ def test_messages_non_streaming_timeout_text_redacted(caplog):
     assert "leaked-timeout-token-77777" not in log_text
 
 
+def test_messages_non_streaming_success_read_error_is_anthropic_json(caplog):
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"partial":'
+            raise httpx.ReadError("Authorization: Bearer leaked-success-read-token-12345")
+
+        async def aclose(self):
+            pass
+
+    def handler(request):
+        return httpx.Response(200, stream=BrokenStream())
+
+    client, _ = _make_client(handler)
+    with caplog.at_level("WARNING"):
+        r = client.post("/claude/v1/messages", json={"model": "x"})
+    assert r.status_code == 502
+    assert r.headers["content-type"].startswith("application/json")
+    msg = r.json()["error"]["message"]
+    assert "Upstream error" in msg
+    assert "leaked-success-read-token-12345" not in msg
+    log_text = "\n".join(rec.message for rec in caplog.records)
+    assert "leaked-success-read-token-12345" not in log_text
+
+
+def test_messages_non_streaming_success_read_timeout_is_anthropic_json(caplog):
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"partial":'
+            raise httpx.ReadTimeout("Authorization: Bearer leaked-success-timeout-token-12345")
+
+        async def aclose(self):
+            pass
+
+    def handler(request):
+        return httpx.Response(200, stream=BrokenStream())
+
+    client, _ = _make_client(handler)
+    with caplog.at_level("WARNING"):
+        r = client.post("/claude/v1/messages", json={"model": "x"})
+    assert r.status_code == 502
+    assert r.headers["content-type"].startswith("application/json")
+    msg = r.json()["error"]["message"]
+    assert "Upstream timeout" in msg
+    assert "leaked-success-timeout-token-12345" not in msg
+    log_text = "\n".join(rec.message for rec in caplog.records)
+    assert "leaked-success-timeout-token-12345" not in log_text
+
+
+def test_messages_non_streaming_success_read_non_http_error_is_anthropic_json(caplog):
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"partial":'
+            raise OSError("socket failed Authorization: Bearer leaked-success-oserror-token-12345")
+
+        async def aclose(self):
+            pass
+
+    def handler(request):
+        return httpx.Response(200, stream=BrokenStream())
+
+    client, _ = _make_client(handler)
+    with caplog.at_level("WARNING"):
+        r = client.post("/claude/v1/messages", json={"model": "x"})
+    assert r.status_code == 502
+    assert r.headers["content-type"].startswith("application/json")
+    msg = r.json()["error"]["message"]
+    assert "Upstream error" in msg
+    assert "leaked-success-oserror-token-12345" not in msg
+    log_text = "\n".join(rec.message for rec in caplog.records)
+    assert "leaked-success-oserror-token-12345" not in log_text
+
+
 def test_models_upstream_exception_text_redacted():
     def handler(request):
         raise httpx.ConnectError("Authorization: Bearer leaked-models-conn-token-9999")
 
     client, _ = _make_client(handler)
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     assert r.status_code == 502
     msg = r.json()["error"]["message"]
     assert "leaked-models-conn-token-9999" not in msg
@@ -797,7 +871,7 @@ def test_messages_streaming_success():
         )
 
     client, _ = _make_client(handler)
-    with client.stream("POST", "/v1/messages", json={"model": "x", "stream": True}) as r:
+    with client.stream("POST", "/claude/v1/messages", json={"model": "x", "stream": True}) as r:
         assert r.status_code == 200
         body = b"".join(r.iter_bytes())
     for c in chunks:
@@ -812,7 +886,7 @@ def test_messages_streaming_upstream_error_response():
         return httpx.Response(429, content=b"slow down")
 
     client, _ = _make_client(handler)
-    r = client.post("/v1/messages", json={"model": "x", "stream": True})
+    r = client.post("/claude/v1/messages", json={"model": "x", "stream": True})
     assert r.status_code == 429
     assert r.json()["error"]["type"] == "rate_limit_error"
 
@@ -829,7 +903,7 @@ def test_messages_streaming_upstream_error_body_logged_and_redacted_when_log_bod
 
     client, _ = _make_client(handler)
     with caplog.at_level("WARNING"):
-        r = client.post("/v1/messages", json={"model": "x", "stream": True})
+        r = client.post("/claude/v1/messages", json={"model": "x", "stream": True})
     log_text = "\n".join(rec.message for rec in caplog.records)
     assert "leaked-token-9999" not in log_text
     assert "***REDACTED***" in log_text
@@ -846,7 +920,7 @@ def test_messages_streaming_upstream_error_body_suppressed_when_log_bodies_off(c
         proxy_port=4141, github_token="gho_test",
         api_base="https://upstream.test",
         integration_id="copilot-developer-cli",
-        editor_version="claude-copilot-cli-relay/test",
+        editor_version="copilot-cli-relay/test",
         log_level="info", log_bodies=False,
     )
     reset_settings_for_tests(s)
@@ -856,7 +930,7 @@ def test_messages_streaming_upstream_error_body_suppressed_when_log_bodies_off(c
 
         client, _ = _make_client(handler)
         with caplog.at_level("WARNING"):
-            client.post("/v1/messages", json={"model": "x", "stream": True})
+            client.post("/claude/v1/messages", json={"model": "x", "stream": True})
         log_text = "\n".join(rec.message for rec in caplog.records)
         assert "sensitive upstream details" not in log_text
         assert "body suppressed" in log_text
@@ -869,7 +943,7 @@ def test_messages_streaming_http_error_during_stream():
         raise httpx.ReadError("connection reset")
 
     client, _ = _make_client(handler)
-    r = client.post("/v1/messages", json={"model": "x", "stream": True})
+    r = client.post("/claude/v1/messages", json={"model": "x", "stream": True})
     assert r.status_code == 502
     assert "Upstream stream error" in r.json()["error"]["message"]
 
@@ -882,7 +956,7 @@ def test_messages_streaming_exception_text_redacted(caplog):
 
     client, _ = _make_client(handler)
     with caplog.at_level("WARNING"):
-        r = client.post("/v1/messages", json={"model": "x", "stream": True})
+        r = client.post("/claude/v1/messages", json={"model": "x", "stream": True})
     body = r.text
     assert "leaked-stream-token-55555" not in body
     log_text = "\n".join(rec.message for rec in caplog.records)
@@ -902,16 +976,16 @@ def test_passthrough_strips_set_cookie():
         )
 
     client, _ = _make_client(handler)
-    r = client.post("/v1/messages", json={"model": "x"})
+    r = client.post("/claude/v1/messages", json={"model": "x"})
     assert r.status_code == 200
     assert "set-cookie" not in {k.lower() for k in r.headers}
 
 
-# ---------- _chunks_with_keepalive ----------
+# ---------- chunks_with_keepalive ----------
 
 @pytest.mark.asyncio
 async def test_chunks_with_keepalive_emits_ping(monkeypatch):
-    monkeypatch.setattr(proxy_mod, "PING_INTERVAL_SECS", 0.02)
+    monkeypatch.setattr(proxy_shared_mod, "PING_INTERVAL_SECS", 0.02)
 
     class FakeUpstream:
         def aiter_bytes(self):
@@ -926,7 +1000,7 @@ async def test_chunks_with_keepalive_emits_ping(monkeypatch):
             return False
 
     out = []
-    async for chunk, sentinel in proxy_mod._chunks_with_keepalive(FakeUpstream(), FakeRequest()):
+    async for chunk, sentinel in proxy_shared_mod.chunks_with_keepalive(FakeUpstream(), FakeRequest()):
         out.append((chunk, sentinel))
         if len(out) >= 5:
             break
@@ -939,7 +1013,7 @@ async def test_chunks_with_keepalive_chunk_arrives_after_ping(monkeypatch):
     """Regression: prior implementation finalized the upstream generator on
     the first ping timeout, silently truncating the stream. The fix decouples
     the upstream pump from the ping timer via a memory channel."""
-    monkeypatch.setattr(proxy_mod, "PING_INTERVAL_SECS", 0.02)
+    monkeypatch.setattr(proxy_shared_mod, "PING_INTERVAL_SECS", 0.02)
 
     class FakeUpstream:
         def aiter_bytes(self):
@@ -955,7 +1029,7 @@ async def test_chunks_with_keepalive_chunk_arrives_after_ping(monkeypatch):
 
     pings = 0
     chunks: list[bytes] = []
-    async for chunk, sentinel in proxy_mod._chunks_with_keepalive(FakeUpstream(), FakeRequest()):
+    async for chunk, sentinel in proxy_shared_mod.chunks_with_keepalive(FakeUpstream(), FakeRequest()):
         if sentinel == "ping":
             pings += 1
             if pings > 50:
@@ -984,7 +1058,7 @@ async def test_chunks_with_keepalive_disconnect():
             return True
 
     out = []
-    async for _chunk, sentinel in proxy_mod._chunks_with_keepalive(FakeUpstream(), FakeRequest()):
+    async for _chunk, sentinel in proxy_shared_mod.chunks_with_keepalive(FakeUpstream(), FakeRequest()):
         out.append(sentinel)
     assert out == ["disconnect"]
 
@@ -1003,7 +1077,7 @@ async def test_chunks_with_keepalive_finishes_cleanly():
             return False
 
     out = []
-    async for chunk, sentinel in proxy_mod._chunks_with_keepalive(FakeUpstream(), FakeRequest()):
+    async for chunk, sentinel in proxy_shared_mod.chunks_with_keepalive(FakeUpstream(), FakeRequest()):
         out.append((chunk, sentinel))
     assert out == [(b"a", None), (b"b", None)]
 
@@ -1026,15 +1100,15 @@ async def test_chunks_with_keepalive_producer_exception_logged_and_terminates(ca
 
     out = []
     raised: list[BaseException] = []
-    with caplog.at_level("WARNING", logger="claude_copilot_cli_relay"):
+    with caplog.at_level("WARNING", logger="copilot_cli_relay"):
         try:
-            async for chunk, sentinel in proxy_mod._chunks_with_keepalive(FakeUpstream(), FakeRequest()):
+            async for chunk, sentinel in proxy_shared_mod.chunks_with_keepalive(FakeUpstream(), FakeRequest()):
                 if sentinel is None:
                     out.append(chunk)
         except httpx.ReadError as exc:
             raised.append(exc)
     assert out == [b"first"]
-    assert raised, "producer exception must propagate so caller emits sse_error_event"
+    assert raised, "producer exception must propagate so caller emits anthropic_sse_error_event"
     assert any("upstream stream pump error" in r.message for r in caplog.records)
 
 
@@ -1096,9 +1170,9 @@ def test_messages_streaming_client_disconnect(monkeypatch):
         req = Request(scope, receive=receive)
 
         # Monkeypatch ping interval small so loop iterates fast.
-        monkeypatch.setattr(proxy_mod, "PING_INTERVAL_SECS", 0.05)
+        monkeypatch.setattr(proxy_shared_mod, "PING_INTERVAL_SECS", 0.05)
 
-        resp = await proxy_mod._stream_response(
+        resp = await claude_proxy_mod._stream_response(
             client=client, url="https://upstream.test/v1/messages",
             body=b"{}", headers={}, request=req,
             model="m", request_id="rid", started=0.0,
@@ -1120,7 +1194,7 @@ def test_messages_streaming_client_disconnect(monkeypatch):
 
 def test_messages_streaming_emits_ping_when_upstream_silent(monkeypatch):
     """Cover the SSE ping branch in _stream_response when upstream is slow."""
-    monkeypatch.setattr(proxy_mod, "PING_INTERVAL_SECS", 0.02)
+    monkeypatch.setattr(proxy_shared_mod, "PING_INTERVAL_SECS", 0.02)
 
     class SlowStream(httpx.AsyncByteStream):
         async def __aiter__(self):
@@ -1134,7 +1208,7 @@ def test_messages_streaming_emits_ping_when_upstream_silent(monkeypatch):
         return httpx.Response(200, stream=SlowStream(), headers={"content-type": "text/event-stream"})
 
     client, _ = _make_client(handler)
-    with client.stream("POST", "/v1/messages", json={"model": "x", "stream": True}) as r:
+    with client.stream("POST", "/claude/v1/messages", json={"model": "x", "stream": True}) as r:
         body = b""
         for chunk in r.iter_bytes():
             body += chunk
@@ -1144,7 +1218,7 @@ def test_messages_streaming_emits_ping_when_upstream_silent(monkeypatch):
     assert b'"type":"ping"' in body
 
 
-def test_messages_streaming_non_http_error_yields_json_error(caplog):
+def test_messages_streaming_non_http_error_yields_anthropic_json_error(caplog):
     """Regression: producer-side errors that aren't httpx.HTTPError subclasses
     (OSError, ssl.SSLError, etc.) must surface as a clean Anthropic JSON error
     envelope instead of a raw 500 from the Starlette default handler."""
@@ -1153,7 +1227,7 @@ def test_messages_streaming_non_http_error_yields_json_error(caplog):
 
     client, _ = _make_client(handler)
     with caplog.at_level("WARNING"):
-        r = client.post("/v1/messages", json={"model": "x", "stream": True})
+        r = client.post("/claude/v1/messages", json={"model": "x", "stream": True})
     assert r.status_code == 502
     body = r.text
     assert "leaked-os-token-12345" not in body
@@ -1178,9 +1252,9 @@ def test_chunks_with_keepalive_redacts_producer_exception_in_log(caplog):
             return False
 
     async def drain():
-        with caplog.at_level("WARNING", logger="claude_copilot_cli_relay"):
+        with caplog.at_level("WARNING", logger="copilot_cli_relay"):
             try:
-                async for _chunk, _sentinel in proxy_mod._chunks_with_keepalive(
+                async for _chunk, _sentinel in proxy_shared_mod.chunks_with_keepalive(
                     FakeUpstream(), FakeRequest()
                 ):
                     pass
@@ -1193,7 +1267,7 @@ def test_chunks_with_keepalive_redacts_producer_exception_in_log(caplog):
     assert "***REDACTED***" in log_text
 
 
-def test_messages_streaming_timeout_returns_json_error(caplog):
+def test_messages_streaming_timeout_returns_anthropic_json_error(caplog):
     """ConnectTimeout from upstream while opening the stream returns a
     proper Anthropic JSON envelope (502), not a stuck connection."""
     def handler(request):
@@ -1201,7 +1275,7 @@ def test_messages_streaming_timeout_returns_json_error(caplog):
 
     client, _ = _make_client(handler)
     with caplog.at_level("WARNING"):
-        r = client.post("/v1/messages", json={"model": "x", "stream": True})
+        r = client.post("/claude/v1/messages", json={"model": "x", "stream": True})
     assert r.status_code == 502
     msg = r.json()["error"]["message"]
     assert "Upstream timeout" in msg
@@ -1227,7 +1301,7 @@ def test_messages_streaming_429_forwards_retry_after_and_ratelimit_headers():
         )
 
     client, _ = _make_client(handler)
-    r = client.post("/v1/messages", json={"model": "x", "stream": True})
+    r = client.post("/claude/v1/messages", json={"model": "x", "stream": True})
     assert r.status_code == 429
     assert r.headers.get("retry-after") == "12"
     assert r.headers.get("x-ratelimit-remaining") == "0"
@@ -1243,7 +1317,7 @@ def test_messages_streaming_401_forwards_www_authenticate():
         )
 
     client, _ = _make_client(handler)
-    r = client.post("/v1/messages", json={"model": "x", "stream": True})
+    r = client.post("/claude/v1/messages", json={"model": "x", "stream": True})
     assert r.status_code == 401
     assert "Bearer" in r.headers.get("www-authenticate", "")
 
@@ -1265,7 +1339,7 @@ def test_messages_streaming_error_body_read_failure_still_returns_status(caplog)
 
     client, _ = _make_client(handler)
     with caplog.at_level("WARNING"):
-        r = client.post("/v1/messages", json={"model": "x", "stream": True})
+        r = client.post("/claude/v1/messages", json={"model": "x", "stream": True})
     assert r.status_code == 503
     body = r.json()
     assert body["error"]["type"] == "api_error"
@@ -1279,7 +1353,7 @@ def test_messages_streaming_error_body_read_failure_still_returns_status(caplog)
 
 
 def test_read_bounded_truncates_at_cap():
-    """_read_bounded returns at most max_bytes even if upstream sends more."""
+    """read_bounded returns at most max_bytes even if upstream sends more."""
     big = b"x" * 100_000
 
     class FakeResp:
@@ -1287,7 +1361,7 @@ def test_read_bounded_truncates_at_cap():
             yield big
             yield big  # would push beyond cap if not truncated
 
-    out = asyncio.run(proxy_mod._read_bounded(FakeResp(), 32 * 1024))
+    out = asyncio.run(proxy_shared_mod.read_bounded(FakeResp(), 32 * 1024))
     assert len(out) == 32 * 1024
 
 
@@ -1308,7 +1382,7 @@ def test_messages_streaming_mid_stream_error_yields_sse_error_frame(caplog):
 
     client, _ = _make_client(handler)
     with caplog.at_level("WARNING"):
-        with client.stream("POST", "/v1/messages", json={"model": "x", "stream": True}) as r:
+        with client.stream("POST", "/claude/v1/messages", json={"model": "x", "stream": True}) as r:
             assert r.status_code == 200  # stream opened cleanly
             body = b"".join(r.iter_bytes()).decode()
     assert "event: message_start" in body
@@ -1322,7 +1396,7 @@ def test_messages_streaming_mid_stream_error_yields_sse_error_frame(caplog):
 
 def test_effort_override_is_case_insensitive():
     """`Claude-Opus-4.7` (mixed case) must still hit the override and clamp `high`→`medium`."""
-    body, _model, _stream = proxy_mod._parse_request(
+    body, _model, _stream = claude_proxy_mod._parse_claude_request(
         json.dumps({"model": "Claude-Opus-4.7", "reasoning_effort": "high"}).encode()
     )
     assert json.loads(body)["reasoning_effort"] == "medium"
@@ -1338,7 +1412,7 @@ def test_passthrough_response_preserves_repeated_headers():
         content=b"x",
         headers=[("Vary", "Accept"), ("Vary", "Origin"), ("X-Keep", "1")],
     )
-    r = _passthrough_response(upstream)
+    r = passthrough_response(upstream)
     vary_values = [v for k, v in r.raw_headers if k.lower() == b"vary"]
     assert vary_values == [b"Accept", b"Origin"]
 
@@ -1360,7 +1434,7 @@ def test_models_upstream_malformed_payload_shapes_dont_crash():
          "name": "Claude Good"},                                                              # the only valid one
     ]
     client, _ = _make_client(lambda req: _models_response(models))
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     assert r.status_code == 200
     body = r.json()
     ids = [m["id"] for m in body["data"]]
@@ -1380,7 +1454,7 @@ def test_models_dedups_after_canonicalization():
          "capabilities": {"type": "chat"}},
     ]
     client, _ = _make_client(lambda req: _models_response(models))
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     ids = [m["id"] for m in r.json()["data"]]
     assert ids == ["claude-opus-4-7"]
 
@@ -1392,7 +1466,7 @@ def test_models_vendor_filter_case_insensitive():
          "capabilities": {"type": "chat"}},
     ]
     client, _ = _make_client(lambda req: _models_response(models))
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     assert [m["id"] for m in r.json()["data"]] == ["claude-x"]
 
 
@@ -1437,7 +1511,7 @@ def test_models_filters_and_canonicalizes():
         {"id": "claude-no-caps", "name": "x", "vendor": "Anthropic"},
     ]
     client, _ = _make_client(lambda req: _models_response(models))
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     assert r.status_code == 200
     body = r.json()
     ids = [m["id"] for m in body["data"]]
@@ -1458,7 +1532,7 @@ def test_models_empty_result():
     client, _ = _make_client(lambda req: _models_response([
         {"id": "x", "vendor": "OpenAI", "capabilities": {"type": "chat"}},
     ]))
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     body = r.json()
     assert body["data"] == []
     assert body["first_id"] is None
@@ -1467,7 +1541,7 @@ def test_models_empty_result():
 
 def test_models_upstream_non_200():
     client, _ = _make_client(lambda req: httpx.Response(500, content=b"down"))
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     assert r.status_code == 500
     assert r.json()["error"]["type"] == "api_error"
 
@@ -1476,7 +1550,7 @@ def test_models_upstream_exception():
     def handler(req):
         raise httpx.ConnectError("nope")
     client, _ = _make_client(handler)
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     assert r.status_code == 502
     assert "Upstream /models error" in r.json()["error"]["message"]
 
@@ -1487,7 +1561,7 @@ def test_models_upstream_200_non_json_body():
         200, content=b"<html>captive portal</html>",
         headers={"content-type": "text/html"},
     ))
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     assert r.status_code == 502
     body = r.json()
     assert body["error"]["type"] == "api_error"
@@ -1497,7 +1571,7 @@ def test_models_upstream_200_non_json_body():
 def test_models_upstream_200_json_array_payload():
     """Defensive: upstream returns a JSON array (not the expected dict)."""
     client, _ = _make_client(lambda req: httpx.Response(200, json=["unexpected", "shape"]))
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     assert r.status_code == 200
     assert r.json()["data"] == []
 
@@ -1507,7 +1581,7 @@ def test_models_upstream_error_body_redacted():
     client, _ = _make_client(lambda req: httpx.Response(
         500, content=b'{"err": "Authorization: Bearer leaked-models-token-9999"}'
     ))
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     assert r.status_code == 500
     msg = r.json()["error"]["message"]
     assert "leaked-models-token-9999" not in msg
@@ -1520,14 +1594,14 @@ def test_models_upstream_non_json_body_redacted():
         200, content=b"oops Authorization: Bearer leaked-non-json-9999",
         headers={"content-type": "application/json"},
     ))
-    r = client.get("/v1/models")
+    r = client.get("/claude/v1/models")
     assert r.status_code == 502
     msg = r.json()["error"]["message"]
     assert "leaked-non-json-9999" not in msg
     assert "***REDACTED***" in msg
 
 
-# ---------- /healthz ----------
+# ---------- /claude/healthz ----------
 
 def test_healthz_upstream_ok():
     client, _ = _make_client(lambda req: _models_response([
@@ -1535,7 +1609,7 @@ def test_healthz_upstream_ok():
         {"id": "claude-y", "vendor": "anthropic", "capabilities": {"type": "chat"}},
         {"id": "gpt-x", "vendor": "OpenAI", "capabilities": {"type": "chat"}},
     ]))
-    r = client.get("/healthz")
+    r = client.get("/claude/healthz")
     body = r.json()
     assert body["ok"] is True
     assert body["upstream_ok"] is True
@@ -1547,7 +1621,7 @@ def test_healthz_upstream_ok():
 
 def test_healthz_upstream_not_ok():
     client, _ = _make_client(lambda req: httpx.Response(503, content=b"down"))
-    r = client.get("/healthz")
+    r = client.get("/claude/healthz")
     body = r.json()
     assert body["ok"] is True
     assert body["upstream_ok"] is False
@@ -1559,7 +1633,7 @@ def test_healthz_upstream_not_ok():
 def test_healthz_upstream_token_expired_hint():
     """401/403 from upstream: include actionable hint pointing at extract-token.ps1."""
     client, _ = _make_client(lambda req: httpx.Response(401, content=b"bad token"))
-    body = client.get("/healthz").json()
+    body = client.get("/claude/healthz").json()
     assert body["upstream_ok"] is False
     assert body["upstream_status"] == 401
     assert "extract-token.ps1" in body["hint"]
@@ -1571,7 +1645,7 @@ def test_healthz_upstream_200_non_json_body_is_not_ok():
         200, content=b"<html>captive portal</html>",
         headers={"content-type": "text/html"},
     ))
-    body = client.get("/healthz").json()
+    body = client.get("/claude/healthz").json()
     assert body["upstream_ok"] is False
     assert body["upstream_status"] == 200
     assert body["anthropic_models"] == 0
@@ -1581,8 +1655,34 @@ def test_healthz_upstream_exception():
     def handler(req):
         raise httpx.ConnectError("kaput")
     client, _ = _make_client(handler)
-    r = client.get("/healthz")
+    r = client.get("/claude/healthz")
     body = r.json()
     assert body["ok"] is True
     assert body["upstream_ok"] is False
     assert body["upstream_status"] is None
+
+
+def test_healthz_compatibility_alias():
+    client, _ = _make_client(lambda req: _models_response([]))
+    assert client.get("/healthz").status_code == 200
+
+
+def test_claude_v1_routes_are_primary_namespace():
+    def handler(req):
+        if req.url.path == "/v1/messages":
+            return httpx.Response(200, json={"id": "msg_1"})
+        return _models_response([
+            {"id": "claude-x", "vendor": "Anthropic", "capabilities": {"type": "chat"}},
+        ])
+
+    client, _ = _make_client(handler)
+
+    messages = client.post("/claude/v1/messages", json={"model": "claude-x", "messages": []})
+    models = client.get("/claude/v1/models")
+
+    assert messages.status_code == 200
+    assert messages.json() == {"id": "msg_1"}
+    assert models.status_code == 200
+    assert models.json()["data"][0]["id"] == "claude-x"
+    assert client.post("/v1/messages", json={"model": "claude-x", "messages": []}).status_code == 404
+    assert client.get("/v1/models").status_code == 404

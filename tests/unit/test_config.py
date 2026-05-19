@@ -1,6 +1,6 @@
 import pytest
 
-from claude_copilot_cli_relay.config import (
+from copilot_cli_relay.config import (
     ConfigError,
     Settings,
     _bool,
@@ -24,6 +24,13 @@ def _set_env(monkeypatch, **kw):
         "COPILOT_ALLOW_INSECURE_API_BASE",
         "COPILOT_INTEGRATION_ID",
         "COPILOT_EDITOR_VERSION",
+        "COPILOT_CODEX_INTEGRATION_ID",
+        "COPILOT_CODEX_EDITOR_VERSION",
+        "COPILOT_CODEX_PLUGIN_VERSION",
+        "COPILOT_CODEX_USER_AGENT",
+        "COPILOT_CODEX_GITHUB_API_VERSION",
+        "COPILOT_CODEX_SESSION_ID",
+        "COPILOT_CODEX_MACHINE_ID",
         "LOG_LEVEL",
         "LOG_BODIES",
     ):
@@ -92,7 +99,14 @@ def test_defaults(monkeypatch):
     assert s.github_token == "gho_abc"
     assert s.api_base == "https://api.githubcopilot.com"
     assert s.integration_id == "copilot-developer-cli"
-    assert s.editor_version == "claude-copilot-cli-relay/0.1.0"
+    assert s.editor_version == "copilot-cli-relay/0.2.0"
+    assert s.codex_integration_id == "copilot-developer-cli"
+    assert s.codex_editor_version == "vscode/1.99.0"
+    assert s.codex_plugin_version == "copilot-chat/0.43.2026033101"
+    assert s.codex_user_agent == "GitHubCopilotChat/0.43.2026033101"
+    assert s.codex_github_api_version == "2026-01-09"
+    assert len(s.codex_session_id) == 36
+    assert len(s.codex_machine_id) == 64
     assert s.log_level == "info"
     assert s.log_bodies is False
 
@@ -105,6 +119,13 @@ def test_overrides(monkeypatch):
         COPILOT_API_BASE="https://example.test/",
         COPILOT_INTEGRATION_ID="vscode-chat",
         COPILOT_EDITOR_VERSION="my-editor/2",
+        COPILOT_CODEX_INTEGRATION_ID="codex-iid",
+        COPILOT_CODEX_EDITOR_VERSION="vscode/2",
+        COPILOT_CODEX_PLUGIN_VERSION="copilot-chat/2",
+        COPILOT_CODEX_USER_AGENT="GitHubCopilotChat/2",
+        COPILOT_CODEX_GITHUB_API_VERSION="2026-02-03",
+        COPILOT_CODEX_SESSION_ID="session-fixed",
+        COPILOT_CODEX_MACHINE_ID="b" * 64,
         LOG_LEVEL="DEBUG",
         LOG_BODIES="yes",
     )
@@ -114,8 +135,26 @@ def test_overrides(monkeypatch):
     assert s.api_base == "https://example.test"  # trailing slash stripped
     assert s.integration_id == "vscode-chat"
     assert s.editor_version == "my-editor/2"
+    assert s.codex_integration_id == "codex-iid"
+    assert s.codex_editor_version == "vscode/2"
+    assert s.codex_plugin_version == "copilot-chat/2"
+    assert s.codex_user_agent == "GitHubCopilotChat/2"
+    assert s.codex_github_api_version == "2026-02-03"
+    assert s.codex_session_id == "session-fixed"
+    assert s.codex_machine_id == "b" * 64
     assert s.log_level == "debug"
     assert s.log_bodies is True
+
+
+def test_codex_integration_defaults_to_anthropic_integration_override(monkeypatch):
+    _set_env(
+        monkeypatch,
+        COPILOT_GITHUB_TOKEN="ghu_abc",
+        COPILOT_INTEGRATION_ID="custom-shared",
+    )
+    s = Settings.from_env()
+    assert s.integration_id == "custom-shared"
+    assert s.codex_integration_id == "custom-shared"
 
 
 def test_get_settings_caches(monkeypatch):

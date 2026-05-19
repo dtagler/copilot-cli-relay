@@ -36,4 +36,4 @@ EXPOSE 4141
 # to uv, and whether it forwards the signal cleanly to uvicorn (so in-flight
 # streams drain instead of being SIGKILL'd after the 10s grace window) is not
 # a guarantee we want to depend on.
-CMD ["/app/.venv/bin/uvicorn", "claude_copilot_cli_relay.server:app", "--host", "0.0.0.0", "--port", "4141"]
+CMD ["/app/.venv/bin/uvicorn", "copilot_cli_relay.server:app", "--host", "0.0.0.0", "--port", "4141"]

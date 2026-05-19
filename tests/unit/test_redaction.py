@@ -1,4 +1,5 @@
-from claude_copilot_cli_relay.logging_setup import redact_bytes, redact_text
+import copilot_cli_relay.logging_setup as logging_setup
+from copilot_cli_relay.logging_setup import redact_bytes, redact_text
 
 
 def test_redacts_gh_tokens():
@@ -178,3 +179,13 @@ def test_redacts_google_api_key():
     out = redact_text(s)
     assert "SyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI" not in out
     assert "AIza***REDACTED***" in out
+
+
+def test_redact_bytes_returns_body_if_redaction_fails(monkeypatch):
+    body = b"not-secret"
+
+    def fail_redaction(text):
+        raise RuntimeError("redaction failure")
+
+    monkeypatch.setattr(logging_setup, "redact_text", fail_redaction)
+    assert logging_setup.redact_bytes(body) == body

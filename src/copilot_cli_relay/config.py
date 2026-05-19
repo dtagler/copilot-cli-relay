@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import secrets
+import uuid
+from dataclasses import dataclass, field
 
 from . import __version__
 
@@ -26,6 +28,13 @@ class Settings:
     editor_version: str
     log_level: str
     log_bodies: bool
+    codex_integration_id: str = "copilot-developer-cli"
+    codex_editor_version: str = "vscode/1.99.0"
+    codex_plugin_version: str = "copilot-chat/0.43.2026033101"
+    codex_user_agent: str = "GitHubCopilotChat/0.43.2026033101"
+    codex_github_api_version: str = "2026-01-09"
+    codex_session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    codex_machine_id: str = field(default_factory=lambda: secrets.token_hex(32))
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -69,9 +78,25 @@ class Settings:
             github_token=token,
             api_base=api_base,
             integration_id=os.environ.get("COPILOT_INTEGRATION_ID", "copilot-developer-cli"),
-            editor_version=os.environ.get("COPILOT_EDITOR_VERSION", f"claude-copilot-cli-relay/{__version__}"),
+            editor_version=os.environ.get("COPILOT_EDITOR_VERSION", f"copilot-cli-relay/{__version__}"),
             log_level=os.environ.get("LOG_LEVEL", "info").lower(),
             log_bodies=_bool(os.environ.get("LOG_BODIES")),
+            codex_integration_id=os.environ.get(
+                "COPILOT_CODEX_INTEGRATION_ID",
+                os.environ.get("COPILOT_INTEGRATION_ID", "copilot-developer-cli"),
+            ),
+            codex_editor_version=os.environ.get("COPILOT_CODEX_EDITOR_VERSION", "vscode/1.99.0"),
+            codex_plugin_version=os.environ.get(
+                "COPILOT_CODEX_PLUGIN_VERSION",
+                "copilot-chat/0.43.2026033101",
+            ),
+            codex_user_agent=os.environ.get(
+                "COPILOT_CODEX_USER_AGENT",
+                "GitHubCopilotChat/0.43.2026033101",
+            ),
+            codex_github_api_version=os.environ.get("COPILOT_CODEX_GITHUB_API_VERSION", "2026-01-09"),
+            codex_session_id=os.environ.get("COPILOT_CODEX_SESSION_ID", str(uuid.uuid4())),
+            codex_machine_id=os.environ.get("COPILOT_CODEX_MACHINE_ID", secrets.token_hex(32)),
         )
 
 

@@ -1,11 +1,11 @@
 ---
-name: model-switch
-description: Switch between Claude models. Use when the user wants to change models, pick a different Claude version, or asks about available models. Triggers on phrases like "switch model", "change model", "use opus", "use sonnet", "use haiku", "which models", "list models", or any mention of switching to a specific Claude model variant. Also use when the user types /model-switch.
+name: claude-model-switch
+description: Switch between Claude Code models exposed by copilot-cli-relay. Use when the user wants to change Claude models, pick a different Claude version, or asks about available Claude models. Triggers on phrases like "switch Claude model", "change Claude model", "use opus", "use sonnet", "use haiku", "which Claude models", "list Claude models", or any mention of switching to a specific Claude model variant. Do not use for Codex, OpenAI, GPT, or `/codex/v1/models` model selection. Also use when the user types /claude-model-switch.
 ---
 
-# Model Switch
+# Claude Model Switch
 
-Switch between Claude models using the built-in `/model` command. Present models clearly and help the user pick the right one.
+Switch between Claude Code models using the built-in `/model` command. Present Claude models clearly and help the user pick the right one. This skill is Claude-specific; Codex/OpenAI model selection is configured through Codex provider settings, not the Claude `/model` command.
 
 ## Available Models
 
@@ -18,14 +18,13 @@ Switch between Claude models using the built-in `/model` command. Present models
 | opus-4.5      | `claude-opus-4-5`                | 200K     |
 | sonnet-4.6    | `claude-sonnet-4-6`              | 200K     |
 | sonnet-4.5    | `claude-sonnet-4-5`              | 200K     |
-| sonnet-4      | `claude-sonnet-4`                | 200K     |
 | haiku-4.5     | `claude-haiku-4-5`               | 200K     |
 
 ## Behavior
 
 When the user invokes this skill:
 
-1. **With an argument** — match it to a model ID (exact or shorthand) and tell the user the exact `/model` command to run. For example, if they say `/model-switch opus47`, respond with: "Run `/model claude-opus-4-7` to switch."
+1. **With an argument** — match it to a Claude model ID (exact or shorthand) and tell the user the exact `/model` command to run. For example, if they say `/claude-model-switch opus47`, respond with: "Run `/model claude-opus-4-7` to switch."
 
 2. **Without an argument** — display the table of available models and ask which one they want.
 
@@ -40,7 +39,6 @@ Accept flexible shorthands. Strip dots, dashes, and spaces, then match case-inse
 - `opus45`, `opus-4.5` → `claude-opus-4-5`
 - `sonnet46`, `sonnet-4.6` → `claude-sonnet-4-6`
 - `sonnet45`, `sonnet-4.5` → `claude-sonnet-4-5`
-- `sonnet4`, `sonnet-4` → `claude-sonnet-4`
 - `haiku45`, `haiku-4.5` → `claude-haiku-4-5`
 - Just `opus` → default to `claude-opus-4-7` (latest Opus)
 - Just `sonnet` → default to `claude-sonnet-4-6` (latest Sonnet)

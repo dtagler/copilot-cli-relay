@@ -1,10 +1,10 @@
 import json
 
-from claude_copilot_cli_relay.proxy import _parse_request
+from copilot_cli_relay.claude_proxy import _parse_claude_request
 
 
 def _rt(body: dict) -> dict:
-    out, _model, _stream = _parse_request(json.dumps(body).encode())
+    out, _model, _stream = _parse_claude_request(json.dumps(body).encode())
     return json.loads(out)
 
 
@@ -35,7 +35,7 @@ def test_haiku_strips_effort_entirely():
 
 def test_no_effort_field_is_passthrough():
     body = {"model": "claude-sonnet-4.6", "messages": [{"role": "user", "content": "hi"}]}
-    out_bytes, model, stream = _parse_request(json.dumps(body).encode())
+    out_bytes, model, stream = _parse_claude_request(json.dumps(body).encode())
     assert json.loads(out_bytes) == body
     assert model == "claude-sonnet-4.6"
     assert stream is False
@@ -48,7 +48,7 @@ def test_already_valid_passthrough():
 
 def test_malformed_body_passthrough():
     raw = b"not json{"
-    out, model, stream = _parse_request(raw)
+    out, model, stream = _parse_claude_request(raw)
     assert out == raw
     assert model is None
     assert stream is False
@@ -62,7 +62,7 @@ def test_non_string_effort_passes_through_unchanged():
         "reasoning_effort": {"level": "high", "tokens": 1000},
         "output_config": {"effort": 5},
     }
-    out, _, _ = _parse_request(json.dumps(body).encode())
+    out, _, _ = _parse_claude_request(json.dumps(body).encode())
     obj = json.loads(out)
     # Original shapes preserved
     assert obj["reasoning_effort"] == {"level": "high", "tokens": 1000}
@@ -77,7 +77,7 @@ def test_haiku_strips_non_string_effort_too():
         "reasoning_effort": {"level": "high"},
         "output_config": {"effort": 7, "other": 1},
     }
-    out, _, _ = _parse_request(json.dumps(body).encode())
+    out, _, _ = _parse_claude_request(json.dumps(body).encode())
     obj = json.loads(out)
     assert "reasoning_effort" not in obj
     assert obj["output_config"] == {"other": 1}
