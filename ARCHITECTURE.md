@@ -69,6 +69,8 @@ src/copilot_cli_relay/
 ├── headers.py           # Anthropic and Codex header builders — strip + rebuild for upstream
 ├── claude_proxy.py      # Claude/Anthropic handlers
 ├── codex_proxy.py       # Codex/OpenAI Responses handlers
+├── model_capabilities.py # ModelCapabilityCache: live /models reasoning-effort caps (stale-while-revalidate)
+├── security.py          # Loopback-host + local-browser guard middleware
 ├── proxy_shared.py      # Shared response filtering, bounded reads, and keepalive streaming
 ├── errors.py            # Anthropic-shaped and OpenAI-shaped JSON + SSE error envelopes
 └── logging_setup.py     # configure_logging() + redact_text/redact_bytes
@@ -80,12 +82,15 @@ Tests mirror that under `tests/unit/`.
 
 ## Request lifecycle: `POST /claude/v1/messages`
 
-1. **Read body once.** `_parse_claude_request(raw_body)` performs a single `json.loads` and returns `(rewritten_body, model, streaming)`. Malformed bodies pass through unchanged so the client sees Copilot's actual error message.
-2. **Rewrite the body for Copilot.** `_apply_effort_rewrite` clamps `reasoning_effort` and `output_config.effort` to per-model allow-lists in `_EFFORT_OVERRIDES`. Examples:
-   - Opus 4.7 → only `medium` is accepted; `high`/`low` are silently downgraded.
-   - Haiku 4.5 → reasoning effort isn't supported at all; the field is *removed* (not clamped).
-   - Empty `output_config` after stripping is dropped entirely.
-   Without this, Claude Code's `xhigh`/`extreme`/`minimal` aliases would 400 upstream.
+1. **Read body once.** `_parse_claude_request(raw_body, caps)` performs a single `json.loads` and returns `(rewritten_body, model, streaming)`. Malformed bodies pass through unchanged so the client sees Copilot's actual error message.
+2. **Rewrite the body for Copilot.** Two massaging steps run before forwarding:
+   - `_apply_thinking_rewrite` converts `thinking: {type: "enabled", budget_tokens: N}` (the legacy extended-thinking shape Claude Code sends) into `thinking: {type: "adaptive"}` and drops `budget_tokens`. Copilot's Anthropic endpoint now rejects `thinking.type.enabled` outright ("Use thinking.type.adaptive and output_config.effort") and rejects `budget_tokens` under adaptive. Other thinking types (`disabled`, already-`adaptive`) pass through.
+   - `_apply_effort_rewrite` first **relocates** any top-level `reasoning_effort` into `output_config.effort` — Copilot no longer accepts the top-level field at all ("Extra inputs are not permitted"); `output_config.effort` is the live control surface (an existing `output_config.effort` wins if both are present). It then clamps that value to the set each model accepts. The allowed set is resolved by `_resolve_allowed_efforts` with this precedence: **live upstream `/models` capabilities** (`capabilities.supports.reasoning_effort`, cached by `ModelCapabilityCache` in `model_capabilities.py`) → the static `_EFFORT_OVERRIDES` fallback (used only when `/models` is unreachable) → the default `{low, medium, high}`. Examples (current upstream advertisement):
+   - Opus 4.8 / Opus 4.7 → only `medium`; `high`/`low`/`xhigh` are downgraded to `medium`.
+   - Haiku 4.5 / Opus 4.5 / Sonnet 4.5 → no `reasoning_effort` advertised, so the effort field is *removed* (not clamped).
+   - Opus 4.7 `-1m-internal` → advertises `low|medium|high|xhigh`, so `xhigh` is preserved (the static table would have wrongly clamped it).
+   - A non-string top-level `reasoning_effort` (can't become an `output_config.effort` string) is dropped rather than forwarded into a guaranteed 400; empty `output_config` after stripping is dropped entirely.
+   Because the allowed set comes from upstream, a new or changed model needs **no code change** — the cache picks it up (TTL ~5 min, single-flight refresh, never fails an in-flight request). The effort clamp runs *after* the 1M model remap (step below) so it keys off the final model id.
 3. **Build outbound headers.** `build_claude_outbound_headers` (in `headers.py`):
    - Strips RFC 7230 §6.1 hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Trailers`, `Transfer-Encoding`, `Upgrade`) plus `Host`, `Content-Length`.
    - **Strips inbound `Authorization`, `x-api-key`, `User-Agent`, `Cookie`, `proxy-authorization`** (any client-supplied auth or session state must NEVER reach upstream — this is a security invariant with regression tests). Upstream `Set-Cookie` is dropped on the way back.

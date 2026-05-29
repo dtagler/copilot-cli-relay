@@ -21,6 +21,7 @@ from copilot_cli_relay.claude_proxy import (
     proxy_claude_models,
 )
 from copilot_cli_relay.config import Settings, reset_settings_for_tests
+from copilot_cli_relay.model_capabilities import ModelCapabilityCache
 from copilot_cli_relay.proxy_shared import passthrough_response
 
 
@@ -117,6 +118,13 @@ def test_parse_claude_request_malformed_body_returns_defaults():
     assert body == b"not json{{{"
     assert model is None
     assert streaming is False
+
+
+def test_peek_model_extracts_or_noops():
+    assert claude_proxy_mod._peek_model(b'{"model": "claude-x"}') == "claude-x"
+    assert claude_proxy_mod._peek_model(b'{}') is None
+    assert claude_proxy_mod._peek_model(b'not json{{{') is None  # malformed -> None
+    assert claude_proxy_mod._peek_model(b'[1, 2]') is None  # non-dict root -> None
 
 
 def test_parse_claude_request_non_dict_body_returns_defaults():
@@ -360,7 +368,8 @@ def test_messages_body_rewrite_applied_before_send():
         json={"model": "claude-opus-4.7", "reasoning_effort": "xhigh"},
     )
     assert r.status_code == 200
-    assert captured["body"]["reasoning_effort"] == "medium"
+    assert "reasoning_effort" not in captured["body"]
+    assert captured["body"]["output_config"]["effort"] == "medium"
 
 
 def test_messages_non_streaming_error_body_read_failure_still_returns_status(caplog):
@@ -490,6 +499,109 @@ def test_passthrough_response_strips_server_header():
 
 
 # ---------- 1M context routing ----------
+
+
+def test_messages_effort_clamped_from_live_caps():
+    """End-to-end: with a model_caps cache attached, the effort clamp uses the
+    live /models capabilities. A model the static table doesn't restrict
+    (opus-4.7-1m-internal) but whose live caps allow xhigh must pass xhigh
+    through, proving caps override the static default."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/models":
+            return httpx.Response(200, json={
+                "data": [{
+                    "id": "claude-opus-4.7-1m-internal",
+                    "vendor": "Anthropic",
+                    "capabilities": {
+                        "type": "chat",
+                        "supports": {"reasoning_effort": ["low", "medium", "high", "xhigh"]},
+                    },
+                }],
+            })
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    client, app = _make_client(handler)
+    app.state.model_caps = ModelCapabilityCache()
+    r = client.post(
+        "/claude/v1/messages",
+        json={"model": "claude-opus-4-7-1m-internal", "reasoning_effort": "xhigh", "messages": []},
+    )
+    assert r.status_code == 200
+    assert "reasoning_effort" not in captured["body"]
+    assert captured["body"]["output_config"]["effort"] == "xhigh"
+
+
+def test_messages_effort_stripped_from_live_caps():
+    """A model whose live caps advertise no reasoning_effort has the field
+    stripped end-to-end, even though the static table wouldn't strip it."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/models":
+            return httpx.Response(200, json={
+                "data": [{
+                    "id": "claude-sonnet-4.5",
+                    "vendor": "Anthropic",
+                    "capabilities": {"type": "chat", "supports": {}},
+                }],
+            })
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    client, app = _make_client(handler)
+    app.state.model_caps = ModelCapabilityCache()
+    client.post(
+        "/claude/v1/messages",
+        json={"model": "claude-sonnet-4-5", "reasoning_effort": "high", "messages": []},
+    )
+    assert "reasoning_effort" not in captured["body"]
+    assert "output_config" not in captured["body"]
+
+
+def test_1m_picker_clamps_effort_against_remapped_model_not_inbound():
+    """Regression for the effort-clamp ordering bug: Claude Code's 1M picker
+    sends inbound model `claude-opus-4-7` (whose live caps allow only medium)
+    plus the context-1m beta, which we remap to `claude-opus-4.7-1m-internal`
+    (which allows xhigh). The effort clamp must key off the FINAL remapped
+    model, so xhigh survives instead of being downgraded to medium."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/models":
+            return httpx.Response(200, json={
+                "data": [
+                    {
+                        "id": "claude-opus-4.7",
+                        "vendor": "Anthropic",
+                        "capabilities": {"type": "chat", "supports": {"reasoning_effort": ["medium"]}},
+                    },
+                    {
+                        "id": "claude-opus-4.7-1m-internal",
+                        "vendor": "Anthropic",
+                        "capabilities": {
+                            "type": "chat",
+                            "supports": {"reasoning_effort": ["low", "medium", "high", "xhigh"]},
+                        },
+                    },
+                ],
+            })
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    client, app = _make_client(handler)
+    app.state.model_caps = ModelCapabilityCache()
+    r = client.post(
+        "/claude/v1/messages",
+        headers={"anthropic-beta": "context-1m-2025-08-07"},
+        json={"model": "claude-opus-4-7", "reasoning_effort": "xhigh", "messages": []},
+    )
+    assert r.status_code == 200
+    assert captured["body"]["model"] == "claude-opus-4.7-1m-internal"
+    assert "reasoning_effort" not in captured["body"]
+    assert captured["body"]["output_config"]["effort"] == "xhigh"
 
 
 def test_1m_remap_opus_47_with_beta_routes_to_internal_variant():
@@ -1395,11 +1507,14 @@ def test_messages_streaming_mid_stream_error_yields_sse_error_frame(caplog):
 # ---------- /v1/messages effort rewrite (case-insensitivity) ----------
 
 def test_effort_override_is_case_insensitive():
-    """`Claude-Opus-4.7` (mixed case) must still hit the override and clamp `high`→`medium`."""
+    """`Claude-Opus-4.7` (mixed case) must still hit the override and clamp
+    `high`->`medium`, relocating into output_config.effort."""
     body, _model, _stream = claude_proxy_mod._parse_claude_request(
         json.dumps({"model": "Claude-Opus-4.7", "reasoning_effort": "high"}).encode()
     )
-    assert json.loads(body)["reasoning_effort"] == "medium"
+    out = json.loads(body)
+    assert "reasoning_effort" not in out
+    assert out["output_config"]["effort"] == "medium"
 
 
 # ---------- /v1/messages response: multi-valued headers ----------

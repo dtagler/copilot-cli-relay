@@ -16,6 +16,7 @@ from .config import get_settings
 from .errors import anthropic_json_error, anthropic_sse_error_event
 from .headers import build_claude_outbound_headers
 from .logging_setup import logger, redact_bytes, redact_text
+from .model_capabilities import EffortCaps
 from .proxy_shared import (
     MAX_UPSTREAM_ERROR_BYTES,
     UPSTREAM_TIMEOUT,
@@ -26,8 +27,13 @@ from .proxy_shared import (
 )
 
 
-def _parse_claude_request(body: bytes) -> tuple[bytes, str | None, bool]:
+def _parse_claude_request(body: bytes, caps: EffortCaps | None = None) -> tuple[bytes, str | None, bool]:
     """Parse the request body once and return (rewritten_body, model, streaming).
+
+    `caps` is an optional upstream capability snapshot (model id -> allowed
+    reasoning_effort set, or None to strip). When provided it takes precedence
+    over the static `_EFFORT_OVERRIDES` fallback; when None, the static table is
+    used (which is what the unit tests and any offline path rely on).
 
     Falls back to (body, None, False) on malformed input — we still forward to
     upstream so the client gets the upstream's actual error message rather than
@@ -41,7 +47,9 @@ def _parse_claude_request(body: bytes) -> tuple[bytes, str | None, bool]:
         return body, None, False
     if not isinstance(parsed, dict):
         return body, None, False
-    new_body, mutated = _apply_effort_rewrite(parsed)
+    thinking_mutated = _apply_thinking_rewrite(parsed)
+    new_body, effort_mutated = _apply_effort_rewrite(parsed, caps)
+    mutated = thinking_mutated or effort_mutated
     # Strict boolean: per Anthropic spec `stream` is a JSON boolean. Accepting
     # truthy non-bool values (e.g. "false", 1, {}) here would silently route
     # the request through the streaming path and return the wrong content
@@ -63,11 +71,19 @@ def _anthropic_kind_for_status(status: int) -> str:
         return "api_error"
     return "invalid_request_error"
 
-# Per-model reasoning-effort constraints discovered empirically from upstream 400s.
+# Static FALLBACK for per-model reasoning-effort constraints, used only when the
+# live `/models` capability snapshot is unavailable (e.g. a /models outage on a
+# cold start). The authoritative source is upstream's
+# `capabilities.supports.reasoning_effort`, consulted via the model-capability
+# cache (see model_capabilities.py). You should NOT need to edit this table when
+# a new model appears — it exists so an offline proxy still degrades sensibly.
 # Models NOT listed accept the standard {low, medium, high}.
 # Keys cover both dot and dash forms — Claude Code may send either; Copilot accepts both.
 _EFFORT_OVERRIDES: dict[str, set[str] | None] = {
-    # Opus 4.7 currently only accepts "medium".
+    # Opus 4.8 and 4.7 currently only accept "medium" (verified upstream via
+    # /models capabilities.supports.reasoning_effort == ["medium"]).
+    "claude-opus-4.8": {"medium"},
+    "claude-opus-4-8": {"medium"},
     "claude-opus-4.7": {"medium"},
     "claude-opus-4-7": {"medium"},
     # Haiku doesn't support reasoning effort at all — strip the field.
@@ -100,7 +116,12 @@ def _normalize_effort(value: Any, allowed: set[str]) -> str:
     if not isinstance(value, str):
         return "medium" if "medium" in allowed else next(iter(allowed))
     v = value.strip().lower()
-    # Common non-standard variants Claude Code may send.
+    # If the value is already directly accepted (e.g. a model whose live caps
+    # advertise "xhigh"), keep it as-is before applying the downgrade aliases.
+    if v in allowed:
+        return v
+    # Common non-standard variants Claude Code may send, mapped to the nearest
+    # standard tier for models that don't accept the exotic value.
     aliases = {
         "xhigh": "high", "x-high": "high", "extra-high": "high", "extreme": "high",
         "xlow": "low", "x-low": "low", "minimal": "low", "none": "low",
@@ -114,55 +135,114 @@ def _normalize_effort(value: Any, allowed: set[str]) -> str:
     return next(iter(allowed))
 
 
-def _apply_effort_rewrite(parsed: dict) -> tuple[bytes, bool]:
-    """Mutate `parsed` in place to clamp reasoning-effort fields, then serialize.
+def _resolve_allowed_efforts(model: Any, caps: EffortCaps | None) -> set[str] | None:
+    """Resolve the allowed reasoning-effort set for `model`.
 
-    Claude Code may send `output_config.effort: xhigh` and similar values that
-    Copilot's Anthropic endpoint rejects. We rewrite to the closest accepted
-    value rather than letting the request 400. Returns (serialized, mutated).
-    When `mutated` is False, callers should prefer the original request bytes
-    so we don't reshape the payload unnecessarily.
+    Precedence: live upstream snapshot (`caps`) > static `_EFFORT_OVERRIDES`
+    fallback > default {low, medium, high}. A returned value of None means
+    "strip the effort field" (model advertises no reasoning_effort support).
+    Lookups are case-insensitive and match either dot or dash id form because
+    the snapshot stores both and the static table is keyed in both forms.
+    """
+    if isinstance(model, str):
+        key = model.lower()
+        if caps is not None and key in caps:
+            return caps[key]
+        if key in _EFFORT_OVERRIDES:
+            return _EFFORT_OVERRIDES[key]
+    return _DEFAULT_EFFORT_VALUES
+
+
+def _apply_thinking_rewrite(parsed: dict) -> bool:
+    """Normalize the `thinking` block for Copilot's Anthropic endpoint.
+
+    Copilot no longer supports `thinking.type: "enabled"` ("Use
+    thinking.type.adaptive and output_config.effort") and rejects
+    `budget_tokens` under the adaptive shape ("Extra inputs are not
+    permitted"). So we convert `enabled` -> `adaptive` and strip `budget_tokens`
+    from either shape; thinking depth is governed by output_config.effort now.
+    Other thinking types (e.g. "disabled") pass through untouched. Returns True
+    if the body was changed.
+    """
+    thinking = parsed.get("thinking")
+    if not isinstance(thinking, dict):
+        return False
+    ttype = thinking.get("type")
+    if ttype not in ("enabled", "adaptive"):
+        return False
+    mutated = False
+    if ttype == "enabled":
+        thinking["type"] = "adaptive"
+        mutated = True
+    if "budget_tokens" in thinking:
+        thinking.pop("budget_tokens", None)
+        mutated = True
+    if mutated:
+        logger.debug("normalized thinking block for model=%s", parsed.get("model"))
+    return mutated
+
+
+def _apply_effort_rewrite(parsed: dict, caps: EffortCaps | None = None) -> tuple[bytes, bool]:
+    """Mutate `parsed` in place to normalize reasoning-effort, then serialize.
+
+    Copilot's Anthropic endpoint controls reasoning effort via
+    `output_config.effort` and no longer accepts a top-level `reasoning_effort`
+    field ("Extra inputs are not permitted"). So we (1) relocate any top-level
+    `reasoning_effort` into `output_config.effort`, then (2) clamp that value to
+    the model's accepted set, rewriting to the closest accepted value rather
+    than letting the request 400. The accepted set is resolved from the live
+    capability snapshot when available (see `_resolve_allowed_efforts`),
+    otherwise the static fallback. Returns (serialized, mutated). When `mutated`
+    is False, callers should prefer the original request bytes so we don't
+    reshape the payload unnecessarily.
     """
     model = parsed.get("model")
-    # Lookup is case-insensitive so e.g. "Claude-Opus-4.7" still hits the
-    # override and we don't silently let an unsupported `high` slip through.
-    lookup_key = model.lower() if isinstance(model, str) else None
-    allowed = _EFFORT_OVERRIDES.get(lookup_key, _DEFAULT_EFFORT_VALUES) if lookup_key else _DEFAULT_EFFORT_VALUES
+    allowed = _resolve_allowed_efforts(model, caps)
 
     mutated = False
 
-    def _handle(container: dict, key: str) -> None:
-        nonlocal mutated
-        if key not in container:
-            return
-        if allowed is None:
-            # Strip the field regardless of value type — model doesn't support
-            # reasoning effort at all, so any shape we'd send is wrong.
-            container.pop(key, None)
-            mutated = True
-            logger.debug("stripped %s for model=%s (not supported)", key, model)
-            return
-        original = container[key]
-        if not isinstance(original, str):
-            # Future API expansion (e.g. dict shapes) — pass through and let
-            # upstream return its own error rather than silently coercing.
-            return
-        new = _normalize_effort(original, allowed)
-        if new != original:
-            container[key] = new
-            mutated = True
-            logger.debug(
-                "clamped %s for model=%s: %r -> %r (allowed=%s)",
-                key, model, original, new, sorted(allowed),
-            )
+    # (1) Relocate a top-level `reasoning_effort` into `output_config.effort`.
+    # Copilot rejects the top-level field outright now; an existing
+    # `output_config.effort` is the canonical control and wins if both are set.
+    if "reasoning_effort" in parsed:
+        moved = parsed.pop("reasoning_effort")
+        mutated = True
+        if isinstance(moved, str):
+            oc = parsed.get("output_config")
+            if not isinstance(oc, dict):
+                oc = {}
+                parsed["output_config"] = oc
+            oc.setdefault("effort", moved)
+        logger.debug("relocated reasoning_effort -> output_config.effort for model=%s", model)
 
-    _handle(parsed, "reasoning_effort")
+    # (2) Clamp output_config.effort against the model's accepted set.
     oc = parsed.get("output_config")
-    if isinstance(oc, dict):
-        _handle(oc, "effort")
-        if not oc:
-            parsed.pop("output_config", None)
+    if isinstance(oc, dict) and "effort" in oc:
+        if allowed is None:
+            # Model doesn't support reasoning effort at all — strip the field
+            # regardless of value type, so any shape we'd send is wrong.
+            oc.pop("effort", None)
             mutated = True
+            logger.debug("stripped output_config.effort for model=%s (not supported)", model)
+        else:
+            original = oc["effort"]
+            if isinstance(original, str):
+                new = _normalize_effort(original, allowed)
+                if new != original:
+                    oc["effort"] = new
+                    mutated = True
+                    logger.debug(
+                        "clamped output_config.effort for model=%s: %r -> %r (allowed=%s)",
+                        model, original, new, sorted(allowed),
+                    )
+            # Non-string values pass through (future API expansion) — let
+            # upstream return its own error rather than silently coercing.
+
+    # Drop a now-empty output_config so we don't forward `output_config: {}`.
+    oc = parsed.get("output_config")
+    if isinstance(oc, dict) and not oc:
+        parsed.pop("output_config", None)
+        mutated = True
 
     # ensure_ascii=False so unicode (emoji, identifiers) isn't \uXXXX-escaped,
     # which both bloats the payload and makes upstream-side debugging harder.
@@ -270,12 +350,49 @@ def _to_upstream_dot_form(model_id: str) -> str | None:
     return f"{m.group(1)}{m.group(2)}.{m.group(3)}{m.group(4)}"
 
 
+async def _get_caps_snapshot(request: Request) -> EffortCaps | None:
+    """Best-effort fetch of the upstream effort-capability snapshot.
+
+    Returns None when no cache is attached (e.g. tests that don't set
+    `app.state.model_caps`), so the request falls back to the static table.
+    `ModelCapabilityCache.get` never raises, so a /models outage can't break
+    the in-flight messages request.
+    """
+    cache = getattr(request.app.state, "model_caps", None)
+    if cache is None:
+        return None
+    client: httpx.AsyncClient = request.app.state.http_client
+    return await cache.get(client, get_settings())
+
+
+def _peek_model(body: bytes) -> str | None:
+    """Read the `model` field without mutating or re-serializing the body.
+
+    Used to drive the 1M remap before reasoning-effort clamping; returns None
+    on malformed JSON or a non-dict root so callers no-op.
+    """
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    return parsed.get("model") if isinstance(parsed, dict) else None
+
+
 async def proxy_claude_messages(request: Request) -> Response:
     settings = get_settings()
     client: httpx.AsyncClient = request.app.state.http_client
 
     raw_body = await request.body()
-    body, model_id, streaming = _parse_claude_request(raw_body)
+    caps = await _get_caps_snapshot(request)
+    # Finalize the upstream model id (1M beta remap, then dash->dot) BEFORE
+    # clamping reasoning-effort, so the clamp keys off the model actually being
+    # invoked. Claude Code's 1M picker tier sends e.g. `claude-opus-4-7` + the
+    # context-1m beta header but the request really runs on
+    # `claude-opus-4.7-1m-internal`, which advertises a wider effort set — so
+    # clamping against the inbound id would wrongly downgrade. The remap and
+    # normalize steps only ever rewrite the `model` field, never effort.
+    body = raw_body
+    model_id = _peek_model(raw_body)
     if _client_wants_1m_context(request.headers):
         body, new_model_id, remapped = _remap_to_1m(body, model_id)
         if remapped:
@@ -287,6 +404,8 @@ async def proxy_claude_messages(request: Request) -> Response:
     # Last hop before upstream: convert -1m ids from the dash form Claude Code
     # uses (and we advertise in /claude/v1/models) to the dot form Copilot requires.
     body, model_id, _ = _normalize_model_for_upstream(body, model_id)
+    # Clamp reasoning-effort last, keyed on the finalized model id.
+    body, model_id, streaming = _parse_claude_request(body, caps=caps)
     request_id = str(uuid.uuid4())
     model = model_id or "?"
     started = time.monotonic()

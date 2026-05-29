@@ -17,6 +17,7 @@ from .codex_proxy import (
 )
 from .config import get_settings
 from .logging_setup import configure_logging, logger
+from .model_capabilities import ModelCapabilityCache
 from .security import LocalBrowserGuardMiddleware, LoopbackHostMiddleware
 
 
@@ -38,9 +39,13 @@ async def lifespan(app: Starlette):
     # If you ever genuinely need an outbound proxy, plumb it through an
     # explicit Settings field rather than re-enabling env discovery.
     app.state.http_client = httpx.AsyncClient(http2=True, trust_env=False)
+    # Caches upstream per-model reasoning_effort capabilities so the Claude
+    # effort clamp adapts to new/changed models without a code change.
+    app.state.model_caps = ModelCapabilityCache()
     try:
         yield
     finally:
+        await app.state.model_caps.aclose()
         await app.state.http_client.aclose()
 
 

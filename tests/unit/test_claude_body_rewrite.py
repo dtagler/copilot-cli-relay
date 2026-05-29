@@ -18,9 +18,70 @@ def test_opus_47_clamps_high_to_medium():
     assert out["output_config"]["effort"] == "medium"
 
 
-def test_opus_47_clamps_xhigh_to_medium():
+def test_opus_47_relocates_and_clamps_top_level_reasoning_effort():
+    # Top-level reasoning_effort is no longer accepted upstream; it's relocated
+    # into output_config.effort and clamped to the model's accepted set.
     out = _rt({"model": "claude-opus-4.7", "reasoning_effort": "xhigh"})
-    assert out["reasoning_effort"] == "medium"
+    assert "reasoning_effort" not in out
+    assert out["output_config"]["effort"] == "medium"
+
+
+def test_opus_48_clamps_high_to_medium():
+    # Opus 4.8 advertises reasoning_effort == ["medium"] upstream, same as 4.7.
+    out = _rt({"model": "claude-opus-4.8", "output_config": {"effort": "high"}})
+    assert out["output_config"]["effort"] == "medium"
+
+
+def test_opus_48_dash_form_relocates_and_clamps_low_to_medium():
+    out = _rt({"model": "claude-opus-4-8", "reasoning_effort": "low"})
+    assert "reasoning_effort" not in out
+    assert out["output_config"]["effort"] == "medium"
+
+
+def test_top_level_reasoning_effort_relocated_to_output_config():
+    # No clamp needed (value already allowed) but the field still moves.
+    out = _rt({"model": "claude-sonnet-4.6", "reasoning_effort": "high"})
+    assert "reasoning_effort" not in out
+    assert out["output_config"]["effort"] == "high"
+
+
+def test_existing_output_config_effort_wins_over_top_level():
+    out = _rt({
+        "model": "claude-sonnet-4.6",
+        "reasoning_effort": "low",
+        "output_config": {"effort": "high"},
+    })
+    assert "reasoning_effort" not in out
+    assert out["output_config"]["effort"] == "high"
+
+
+def test_thinking_enabled_rewritten_to_adaptive():
+    out = _rt({
+        "model": "claude-opus-4.8",
+        "thinking": {"type": "enabled", "budget_tokens": 2048},
+    })
+    assert out["thinking"] == {"type": "adaptive"}
+
+
+def test_thinking_adaptive_budget_tokens_stripped():
+    # Upstream rejects budget_tokens under adaptive too, so strip it even when
+    # the client already sent type=adaptive.
+    out = _rt({
+        "model": "claude-opus-4.8",
+        "thinking": {"type": "adaptive", "budget_tokens": 2048},
+    })
+    assert out["thinking"] == {"type": "adaptive"}
+
+
+def test_thinking_adaptive_without_budget_passthrough():
+    body = {"model": "claude-opus-4.8", "thinking": {"type": "adaptive"}, "max_tokens": 8}
+    out_bytes, _, _ = _parse_claude_request(json.dumps(body).encode())
+    assert json.loads(out_bytes) == body  # no mutation -> original bytes
+
+
+def test_thinking_other_types_pass_through():
+    out = _rt({"model": "claude-opus-4.8", "thinking": {"type": "disabled"}})
+    assert out["thinking"] == {"type": "disabled"}
 
 
 def test_haiku_strips_effort_entirely():
@@ -54,9 +115,11 @@ def test_malformed_body_passthrough():
     assert stream is False
 
 
-def test_non_string_effort_passes_through_unchanged():
-    """Future API expansion (e.g. dict shapes) must not be silently coerced
-    to a string — pass through and let upstream return its own error."""
+def test_non_string_top_level_reasoning_effort_dropped():
+    """Top-level reasoning_effort is no longer an accepted upstream field, so a
+    non-string value (which can't sensibly become output_config.effort) is
+    dropped rather than forwarded into a guaranteed 400. A non-string
+    output_config.effort still passes through for upstream to judge."""
     body = {
         "model": "claude-sonnet-4.6",
         "reasoning_effort": {"level": "high", "tokens": 1000},
@@ -64,8 +127,7 @@ def test_non_string_effort_passes_through_unchanged():
     }
     out, _, _ = _parse_claude_request(json.dumps(body).encode())
     obj = json.loads(out)
-    # Original shapes preserved
-    assert obj["reasoning_effort"] == {"level": "high", "tokens": 1000}
+    assert "reasoning_effort" not in obj
     assert obj["output_config"]["effort"] == 5
 
 

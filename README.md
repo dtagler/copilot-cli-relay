@@ -16,7 +16,7 @@
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/python-3.14+-blue?logo=python&logoColor=white">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-235%20passing-brightgreen?logo=pytest&logoColor=white">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-268%20passing-brightgreen?logo=pytest&logoColor=white">
   <img alt="Coverage" src="https://img.shields.io/badge/coverage-100%25-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?logo=windows11&logoColor=white">
@@ -156,11 +156,11 @@ Codex uses its own path prefix so Claude Code's `/claude/v1/models` response sta
 # Print the Codex config snippet
 pwsh scripts\codex-config.ps1
 
-# Optional: update ~/.codex/config.toml and persist the dummy key after typing YES
+# Optional: write ~/.codex/config.toml + ~/.codex/copilot.config.toml and persist the dummy key after typing YES
 pwsh scripts\codex-config.ps1 -Write
 ```
 
-The snippet configures:
+The helper configures two files. The provider lives in `~/.codex/config.toml`:
 
 ```toml
 [model_providers.copilot]
@@ -172,8 +172,12 @@ requires_openai_auth = false
 request_max_retries = 4
 stream_max_retries = 10
 stream_idle_timeout_ms = 300000
+```
 
-[profiles.copilot]
+The profile lives in its own `~/.codex/copilot.config.toml` (top-level keys, **not** a `[profiles.copilot]` table). Codex 0.134+ overlays this file when you pass `--profile copilot` and no longer reads a legacy `[profiles.copilot]` table or a `profile = "copilot"` selector from `config.toml`; `-Write` removes any such legacy tables for you:
+
+```toml
+# ~/.codex/copilot.config.toml
 model_provider = "copilot"
 model = "gpt-5.5"
 model_reasoning_effort = "medium"
@@ -242,7 +246,7 @@ For consistency, set both the top-level `"model"` and `ANTHROPIC_MODEL` to the s
 A few things to know about the IDs:
 
 - **Use the dash form** (`claude-opus-4-7`, not `claude-opus-4.7`). The proxy canonicalizes `/claude/v1/models` output to dash form because that's the shape Claude Code recognizes as a known Anthropic model — using it unlocks the right request shape (adaptive thinking, etc.). Both forms work upstream, but dash is what you want here.
-- **`effortLevel`** is Claude Code's reasoning-effort knob. Valid values are `low`, `medium`, `high`. The proxy clamps per-model: Opus 4.7 currently only accepts `medium`, and Haiku 4.5 doesn't support reasoning effort at all (the field is stripped). If you set `high` for an Opus 4.7 default, the proxy quietly downgrades it to `medium` rather than letting the request 400.
+- **`effortLevel`** is Claude Code's reasoning-effort knob. Valid values are `low`, `medium`, `high`. The proxy clamps each request to the values the target model actually accepts, read live from Copilot's `/models` capabilities (cached, ~5 min) and falling back to a small built-in table only if `/models` is unreachable. Currently Opus 4.8 and Opus 4.7 accept only `medium`, and Haiku 4.5 / Opus 4.5 / Sonnet 4.5 don't support reasoning effort at all (the field is stripped). If you set `high` for an Opus 4.8 / 4.7 default, the proxy quietly downgrades it to `medium` rather than letting the request 400 — and because the allowed set is read from upstream, new models are handled automatically without a proxy update. Copilot's endpoint also moved this knob: it now wants `output_config.effort` (not a top-level `reasoning_effort`) and `thinking.type: "adaptive"` (not `"enabled"` with a `budget_tokens`). The proxy rewrites both legacy shapes for you, so Claude Code's older request bodies keep working.
 - **1M context:** Copilot exposes 1M-context variants for Opus 4.6 and 4.7 only — `/claude/v1/models` advertises them as `claude-opus-4-6-1m` and `claude-opus-4-7-1m-internal` (dash form, what Claude Code's `/model` validation accepts). The proxy converts these ids to the dot form (`claude-opus-4.6-1m` / `claude-opus-4.7-1m-internal`) only at the last hop before forwarding upstream — Copilot returns `model_not_supported` for the dash form on these specific ids, while accepting both forms for every other model. When Claude Code's hardcoded "Opus 4.7 (1M context)" picker tier sends the standard `claude-opus-4-7` id plus the `context-1m-2025-08-07` beta header, the proxy auto-rewrites the model id to the 1M variant so you actually get 1M context (Copilot rejects the beta header itself; the `-1m` model id is the real switch). To pin a 1M variant as your session default, set `"model": "claude-opus-4-7-1m-internal"` in `settings.json`. Sonnet has no 1M variant on this tenant — picker tier "Sonnet (1M context)" silently downgrades to 200K because there's nothing to remap to.
 - **Switching mid-session:** `/model claude-sonnet-4-6` inside Claude Code changes the model for the current conversation without editing `settings.json`.
 
@@ -356,8 +360,34 @@ Optional env vars to consider adding to the `"env"` block:
 - **Codex says stream disconnected before completion:** confirm the proxy is running and Codex is pointed at `http://127.0.0.1:4141/codex/v1`, not the Claude base URL `http://127.0.0.1:4141/claude`.
 - **Codex says `Missing environment variable: CODEX_PROXY_API_KEY`:** run `pwsh scripts\codex-config.ps1 -Write`, then open a new PowerShell terminal. In an already-open terminal, run `$env:CODEX_PROXY_API_KEY = "dummy"` before `codex -p copilot`.
 - **Codex 401 or missing auth:** use `env_key = "CODEX_PROXY_API_KEY"` and set `$env:CODEX_PROXY_API_KEY = "dummy"` before running Codex.
+- **Codex errors with `--profile copilot cannot be used while ... contains legacy profile = "copilot" or [profiles.copilot] config`:** Codex 0.134+ moved profiles into their own file. Re-run `pwsh scripts\codex-config.ps1 -Write` (it removes the legacy `[profiles.copilot*]` tables from `config.toml` and writes the profile to `~/.codex/copilot.config.toml`). To migrate by hand, move the keys under `[profiles.copilot]` into `~/.codex/copilot.config.toml` as top-level keys (drop the `profiles.copilot` prefix) and delete the legacy tables.
 - **Codex model not supported:** run `curl http://127.0.0.1:4141/codex/v1/models` and pick a model listed there. The default is `gpt-5.5` when your Copilot tenant exposes it.
 - **Codex model discovery:** `/codex/v1/models` includes both OpenAI-compatible `data` and Codex-compatible `models` fields.
+
+### When a new or changed model breaks Claude
+
+Upstream model availability and request schemas change without notice. Reasoning-effort *values* are handled automatically (read live from `/models`), but a *schema* change — a renamed field, a new required shape — needs a quick diagnosis. The drill:
+
+1. **Confirm it's upstream, not you.** Hit the model directly through the proxy and read the error. A 400 like `reasoning_effort: Extra inputs are not permitted` or `thinking.type.enabled is not supported` is an upstream schema change, not a proxy bug:
+   ```powershell
+   $b = @{model="claude-opus-4-8"; max_tokens=16; messages=@(@{role="user"; content="hi"})} | ConvertTo-Json -Depth 6
+   curl.exe -s -H "content-type: application/json" -d $b http://127.0.0.1:4141/claude/v1/messages
+   ```
+   Add the field you suspect (`reasoning_effort`, `output_config`, `thinking`) and compare. The upstream message usually tells you the new shape ("Use thinking.type.adaptive and output_config.effort").
+2. **Check advertised capabilities** for the model (effort values, context, endpoints):
+   ```powershell
+   $tok = (Select-String -Path .env -Pattern "COPILOT_GITHUB_TOKEN=(.+)").Matches[0].Groups[1].Value.Trim()
+   curl.exe -s -H "Authorization: Bearer $tok" -H "Copilot-Integration-Id: copilot-developer-cli" `
+     https://api.githubcopilot.com/models | ConvertFrom-Json | % data | ? vendor -eq Anthropic |
+     % { "{0,-32} effort=[{1}]" -f $_.id, ($_.capabilities.supports.reasoning_effort -join ",") }
+   ```
+   Note that `/models` can advertise a capability the `/v1/messages` endpoint no longer accepts in the old place — trust the live `/v1/messages` error over the catalog.
+3. **Fix in the right spot** (almost always one of these, not the handler):
+   - Reasoning-effort *values* per model → nothing to do; the live cache adapts.
+   - A new model id that needs a `-1m` remap → `_MODEL_1M_REWRITES` / `_DASH_1M_VERSION_RE` in `claude_proxy.py`.
+   - A renamed/moved body field (like `reasoning_effort` → `output_config.effort`, or `thinking.type` enabled → adaptive) → the body-massaging helpers `_apply_effort_rewrite` / `_apply_thinking_rewrite` in `claude_proxy.py`.
+   - A beta token Copilot rejects → `UNSUPPORTED_BETA_TOKENS` in `headers.py`.
+4. **Add a unit test** asserting the new rewrite (see `tests/unit/test_claude_body_rewrite.py`), then re-run the suite and live-verify the model returns 200. Codex is fully dynamic (it filters `/models` on `/responses` support) and rarely needs model-specific changes.
 
 ## Development
 
