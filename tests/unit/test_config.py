@@ -99,7 +99,7 @@ def test_defaults(monkeypatch):
     assert s.github_token == "gho_abc"
     assert s.api_base == "https://api.githubcopilot.com"
     assert s.integration_id == "copilot-developer-cli"
-    assert s.editor_version == "copilot-cli-relay/0.2.0"
+    assert s.editor_version == "copilot-cli-relay/0.3.0"
     assert s.codex_integration_id == "copilot-developer-cli"
     assert s.codex_editor_version == "vscode/1.99.0"
     assert s.codex_plugin_version == "copilot-chat/0.43.2026033101"

@@ -1,6 +1,6 @@
 [project]
 name = "copilot-cli-relay"
-version = "0.2.0"
+version = "0.3.0"
 description = "Reverse proxy that lets Claude Code and Codex CLI use GitHub Copilot Enterprise through Copilot's native protocol endpoints."
 requires-python = ">=3.14"
 dependencies = [

@@ -240,7 +240,7 @@ Runtime config comes from environment variables. `config.py:Settings.from_env()`
     </tr>
     <tr>
       <td width="320"><code>COPILOT_EDITOR_VERSION</code></td>
-      <td><code>copilot-cli-relay/0.2.0</code></td>
+      <td><code>copilot-cli-relay/0.3.0</code></td>
       <td>Sent as <code>Editor-Version</code> and <code>User-Agent</code>.</td>
     </tr>
     <tr>
