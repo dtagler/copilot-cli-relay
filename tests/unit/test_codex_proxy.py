@@ -356,6 +356,56 @@ def test_codex_models_context_window_falls_back_when_limits_missing_or_malformed
     assert [model["max_context_window"] for model in response.json()["models"]] == [272_000, 272_000]
 
 
+def test_codex_models_uses_live_reasoning_and_vision_capabilities():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [{
+                    "id": "gpt-5.6-sol",
+                    "name": "GPT-5.6 Sol",
+                    "supported_endpoints": ["/responses"],
+                    "capabilities": {
+                        "supports": {
+                            "parallel_tool_calls": True,
+                            "reasoning_effort": ["none", "low", "medium", "high", "xhigh", "max"],
+                            "vision": True,
+                        },
+                        "limits": {"max_context_window_tokens": 1_050_000},
+                    },
+                }]
+            },
+        )
+
+    client, _ = _make_client(handler)
+    model = client.get("/codex/v1/models").json()["models"][0]
+
+    assert model["slug"] == "gpt-5.6-sol"
+    assert [level["effort"] for level in model["supported_reasoning_levels"]] == [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+    assert model["default_reasoning_level"] == "medium"
+    assert model["input_modalities"] == ["text", "image"]
+    assert model["context_window"] == 1_050_000
+
+
+def test_codex_reasoning_levels_skips_invalid_and_duplicate_values():
+    levels = codex_mod._codex_reasoning_levels({
+        "capabilities": {
+            "supports": {
+                "reasoning_effort": [None, "", " HIGH ", "high", 7],
+            }
+        }
+    })
+
+    assert levels == [{"effort": "high", "description": "Greater reasoning depth"}]
+
+
 def test_codex_models_openai_shape_still_present():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

@@ -191,7 +191,7 @@ Claude Code is isolated under `/claude/v1` and Codex CLI is isolated under `/cod
 
 `POST /codex/v1/responses/compact` first tries `{COPILOT_API_BASE}/responses/compact`. Copilot currently returns 404, so the proxy appends a checkpoint-compaction prompt to the input, calls normal `/responses` with `stream: false` and `store: false`, and wraps the result as `object: "response.compaction"`.
 
-`GET /codex/v1/models` calls `{COPILOT_API_BASE}/models`, keeps models whose `supported_endpoints` include `/responses`, and returns both the OpenAI list envelope (`object: "list"`, `data: [...]`) and Codex's model catalog envelope (`models: [...]`) for compatibility with Codex model discovery. The catalog entries include the fields current Codex CLI deserializes as model metadata, including base instructions, reasoning-summary flags, verbosity support, truncation policy, parallel-tool-call support, context-window hints, input modalities, and search-tool support.
+`GET /codex/v1/models` calls `{COPILOT_API_BASE}/models`, keeps models whose `supported_endpoints` include `/responses`, and returns both the OpenAI list envelope (`object: "list"`, `data: [...]`) and Codex's model catalog envelope (`models: [...]`) for compatibility with Codex model discovery. The catalog entries include the fields current Codex CLI deserializes as model metadata, including live reasoning-effort values, vision input support, base instructions, reasoning-summary flags, verbosity support, truncation policy, parallel-tool-call support, context-window hints, and search-tool support. Codex 0.143+ refreshes custom-provider models only when the provider uses command auth, so `codex-config.ps1` configures a command that emits a non-secret dummy token. The relay discards that token before forwarding.
 
 ---
 
@@ -240,7 +240,7 @@ Runtime config comes from environment variables. `config.py:Settings.from_env()`
     </tr>
     <tr>
       <td width="320"><code>COPILOT_EDITOR_VERSION</code></td>
-      <td><code>copilot-cli-relay/0.3.0</code></td>
+      <td><code>copilot-cli-relay/0.4.0</code></td>
       <td>Sent as <code>Editor-Version</code> and <code>User-Agent</code>.</td>
     </tr>
     <tr>

@@ -33,6 +33,18 @@ Include:
 
 Be concise, structured, and focused on helping the next LLM seamlessly continue the work."""
 
+_DEFAULT_CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+_REASONING_EFFORT_DESCRIPTIONS = {
+    "none": "Disables reasoning",
+    "minimal": "Minimal reasoning",
+    "low": "Fast responses with lighter reasoning",
+    "medium": "Balances speed and reasoning depth",
+    "high": "Greater reasoning depth",
+    "xhigh": "Extra high reasoning depth",
+    "max": "Maximum reasoning depth",
+    "ultra": "Ultra reasoning depth",
+}
+
 
 def _openai_kind_for_status(status: int) -> str:
     if status == 401:
@@ -491,20 +503,56 @@ def _model_context_window(model: dict[str, Any]) -> int:
     return 272_000
 
 
+def _codex_reasoning_levels(model: dict[str, Any]) -> list[dict[str, str]]:
+    capabilities = model.get("capabilities")
+    supports = capabilities.get("supports") if isinstance(capabilities, dict) else None
+    raw_efforts = supports.get("reasoning_effort") if isinstance(supports, dict) else None
+
+    efforts: list[str] = []
+    if isinstance(raw_efforts, list):
+        seen: set[str] = set()
+        for value in raw_efforts:
+            if not isinstance(value, str):
+                continue
+            effort = value.strip().lower()
+            if not effort or effort in seen:
+                continue
+            seen.add(effort)
+            efforts.append(effort)
+    if not efforts:
+        efforts = list(_DEFAULT_CODEX_REASONING_EFFORTS)
+
+    return [
+        {
+            "effort": effort,
+            "description": _REASONING_EFFORT_DESCRIPTIONS.get(
+                effort, f"{effort.title()} reasoning effort"
+            ),
+        }
+        for effort in efforts
+    ]
+
+
+def _codex_input_modalities(model: dict[str, Any]) -> list[str]:
+    capabilities = model.get("capabilities")
+    supports = capabilities.get("supports") if isinstance(capabilities, dict) else None
+    if isinstance(supports, dict) and supports.get("vision") is True:
+        return ["text", "image"]
+    return ["text"]
+
+
 def _codex_model_info(model: dict[str, Any], model_id: str) -> dict[str, Any]:
     name = model.get("name") if isinstance(model.get("name"), str) else model_id
     context_window = _model_context_window(model)
+    reasoning_levels = _codex_reasoning_levels(model)
+    reasoning_efforts = {level["effort"] for level in reasoning_levels}
+    default_reasoning_level = "medium" if "medium" in reasoning_efforts else reasoning_levels[0]["effort"]
     return {
         "slug": model_id,
         "display_name": name,
         "description": f"{name} via GitHub Copilot.",
-        "default_reasoning_level": "medium",
-        "supported_reasoning_levels": [
-            {"effort": "low", "description": "Fast responses with lighter reasoning"},
-            {"effort": "medium", "description": "Balances speed and reasoning depth"},
-            {"effort": "high", "description": "Greater reasoning depth"},
-            {"effort": "xhigh", "description": "Extra high reasoning depth"},
-        ],
+        "default_reasoning_level": default_reasoning_level,
+        "supported_reasoning_levels": reasoning_levels,
         "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": True,
@@ -530,7 +578,7 @@ def _codex_model_info(model: dict[str, Any], model_id: str) -> dict[str, Any]:
         "max_context_window": context_window,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": ["text"],
+        "input_modalities": _codex_input_modalities(model),
         "supports_search_tool": True,
     }
 

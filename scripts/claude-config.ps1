@@ -19,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 
 $baseUrl = 'http://127.0.0.1:4141/claude'
 $authToken = 'sk-dummy'
-$model = 'claude-opus-4-8'
+$model = 'claude-sonnet-5'
 $smallModel = 'claude-sonnet-4-6'
 
 $snippet = @"

@@ -16,7 +16,7 @@
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/python-3.14+-blue?logo=python&logoColor=white">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-268%20passing-brightgreen?logo=pytest&logoColor=white">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-270%20passing-brightgreen?logo=pytest&logoColor=white">
   <img alt="Coverage" src="https://img.shields.io/badge/coverage-100%25-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?logo=windows11&logoColor=white">
@@ -124,10 +124,10 @@ The helper writes the same settings as this manual `~/.claude/settings.json` exa
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:4141/claude",
     "ANTHROPIC_AUTH_TOKEN": "sk-dummy",
-    "ANTHROPIC_MODEL": "claude-opus-4-7",
+    "ANTHROPIC_MODEL": "claude-sonnet-5",
     "ANTHROPIC_SMALL_FAST_MODEL": "claude-sonnet-4-6"
   },
-  "model": "claude-opus-4-7",
+  "model": "claude-sonnet-5",
   "effortLevel": "medium"
 }
 ```
@@ -156,7 +156,7 @@ Codex uses its own path prefix so Claude Code's `/claude/v1/models` response sta
 # Print the Codex config snippet
 pwsh scripts\codex-config.ps1
 
-# Optional: write ~/.codex/config.toml + ~/.codex/copilot.config.toml and persist the dummy key after typing YES
+# Optional: write ~/.codex/config.toml + ~/.codex/copilot.config.toml after typing YES
 pwsh scripts\codex-config.ps1 -Write
 ```
 
@@ -167,11 +167,16 @@ The helper configures two files. The provider lives in `~/.codex/config.toml`:
 name = "GitHub Copilot via local relay"
 base_url = "http://127.0.0.1:4141/codex/v1"
 wire_api = "responses"
-env_key = "CODEX_PROXY_API_KEY"
 requires_openai_auth = false
 request_max_retries = 4
 stream_max_retries = 10
 stream_idle_timeout_ms = 300000
+
+[model_providers.copilot.auth]
+command = "pwsh"
+args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('dummy')"]
+timeout_ms = 5000
+refresh_interval_ms = 0
 ```
 
 The profile lives in its own `~/.codex/copilot.config.toml` (top-level keys, **not** a `[profiles.copilot]` table). Codex 0.134+ overlays this file when you pass `--profile copilot` and no longer reads a legacy `[profiles.copilot]` table or a `profile = "copilot"` selector from `config.toml`; `-Write` removes any such legacy tables for you:
@@ -179,7 +184,7 @@ The profile lives in its own `~/.codex/copilot.config.toml` (top-level keys, **n
 ```toml
 # ~/.codex/copilot.config.toml
 model_provider = "copilot"
-model = "gpt-5.5"
+model = "gpt-5.6-sol"
 model_reasoning_effort = "medium"
 ```
 
@@ -189,20 +194,13 @@ Then start Codex with the relay profile. The proxy strips the dummy client auth 
 codex -p copilot
 ```
 
-The `-Write` helper stores `CODEX_PROXY_API_KEY=dummy` as a Windows user environment variable and adds it to your PowerShell profile. Already-open terminals do not inherit new user env vars, so either open a new terminal or run this once before launching Codex:
-
-```powershell
-$env:CODEX_PROXY_API_KEY = "dummy"
-codex -p copilot
-```
-
-Codex 0.130 sends `Authorization` only when the provider uses `env_key`; a literal `api_key = "dummy"` in `config.toml` did not send auth during testing. The proxy strips Codex's unsupported `image_generation` tool and `previous_response_id` before forwarding. `web_search` is preserved because this tenant's Copilot `/responses` endpoint accepts it.
+The command-auth block emits a non-secret local dummy token. Codex 0.143+ only refreshes `/models` for custom providers with command auth; an `env_key` provider falls back to Codex's bundled picker and hides Copilot models such as GPT-5.6. The relay discards the dummy token and injects your Copilot OAuth bearer upstream. The proxy also strips Codex's unsupported `image_generation` tool and `previous_response_id` before forwarding. `web_search` is preserved because this tenant's Copilot `/responses` endpoint accepts it.
 
 Useful Codex checks:
 
 ```powershell
 # Confirm Codex can read the proxy model catalog
-codex debug models -c model_provider='"copilot"' -c model='"gpt-5.5"'
+codex debug models -c model_provider='"copilot"' -c model='"gpt-5.6-sol"'
 
 # Minimal end-to-end request through the proxy
 codex exec --skip-git-repo-check --ephemeral --sandbox read-only -p copilot "Reply with exactly ok."
@@ -358,10 +356,10 @@ Optional env vars to consider adding to the `"env"` block:
 - **`Unable to connect to API (ConnectionRefused)` in Claude Code:** the container isn't running. `docker compose up -d proxy` brings it back. The compose file uses `restart: unless-stopped`, so this should only happen after a clean `docker compose down`.
 - **Claude Code posts to `/v1/messages` and gets 404:** your Claude base URL is missing the namespace. Run `pwsh scripts\claude-config.ps1 -Write`, restart Claude Code, and confirm `ANTHROPIC_BASE_URL` is `http://127.0.0.1:4141/claude`.
 - **Codex says stream disconnected before completion:** confirm the proxy is running and Codex is pointed at `http://127.0.0.1:4141/codex/v1`, not the Claude base URL `http://127.0.0.1:4141/claude`.
-- **Codex says `Missing environment variable: CODEX_PROXY_API_KEY`:** run `pwsh scripts\codex-config.ps1 -Write`, then open a new PowerShell terminal. In an already-open terminal, run `$env:CODEX_PROXY_API_KEY = "dummy"` before `codex -p copilot`.
-- **Codex 401 or missing auth:** use `env_key = "CODEX_PROXY_API_KEY"` and set `$env:CODEX_PROXY_API_KEY = "dummy"` before running Codex.
+- **Codex `/model` only shows bundled models such as GPT-5.5:** run `pwsh scripts\codex-config.ps1 -Write` to replace the old `env_key` provider with command auth, then restart Codex.
+- **Codex 401 or missing auth:** re-run `pwsh scripts\codex-config.ps1 -Write` and confirm `[model_providers.copilot.auth]` is present in `~/.codex/config.toml`.
 - **Codex errors with `--profile copilot cannot be used while ... contains legacy profile = "copilot" or [profiles.copilot] config`:** Codex 0.134+ moved profiles into their own file. Re-run `pwsh scripts\codex-config.ps1 -Write` (it removes the legacy `[profiles.copilot*]` tables from `config.toml` and writes the profile to `~/.codex/copilot.config.toml`). To migrate by hand, move the keys under `[profiles.copilot]` into `~/.codex/copilot.config.toml` as top-level keys (drop the `profiles.copilot` prefix) and delete the legacy tables.
-- **Codex model not supported:** run `curl http://127.0.0.1:4141/codex/v1/models` and pick a model listed there. The default is `gpt-5.5` when your Copilot tenant exposes it.
+- **Codex model not supported:** run `curl http://127.0.0.1:4141/codex/v1/models` and pick a model listed there. The current default is `gpt-5.6-sol` when your Copilot tenant exposes it.
 - **Codex model discovery:** `/codex/v1/models` includes both OpenAI-compatible `data` and Codex-compatible `models` fields.
 
 ### When a new or changed model breaks Claude

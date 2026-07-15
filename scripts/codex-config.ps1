@@ -9,8 +9,8 @@
   (Codex 0.134+ overlays `--profile copilot` from that separate file and no
   longer reads a legacy [profiles.copilot] table from config.toml). It also
   removes any legacy [profiles.copilot*] tables / `profile = "copilot"` selector
-  from config.toml, and persists the local dummy CODEX_PROXY_API_KEY for new
-  PowerShell sessions. All file/environment changes require an explicit YES.
+  from config.toml. The provider uses a non-secret command token so Codex 0.143+
+  refreshes its model picker from the relay. All file changes require an explicit YES.
 #>
 #requires -Version 7
 [CmdletBinding()]
@@ -24,20 +24,24 @@ $ErrorActionPreference = 'Stop'
 # Provider definition lives in the base config.toml (project-local configs can't
 # override providers, and the profile file overlays on top of it).
 $providerSnippet = @'
+[model_providers.copilot]
 # GitHub Copilot via copilot-cli-relay.
 # Start the proxy first: docker compose up -d proxy
-# Codex must have a local dummy key in the environment:
-#   $env:CODEX_PROXY_API_KEY = "dummy"
-
-[model_providers.copilot]
 name = "GitHub Copilot via local relay"
 base_url = "http://127.0.0.1:4141/codex/v1"
 wire_api = "responses"
-env_key = "CODEX_PROXY_API_KEY"
 requires_openai_auth = false
 request_max_retries = 4
 stream_max_retries = 10
 stream_idle_timeout_ms = 300000
+
+# Command auth makes Codex refresh /models for this custom provider. The relay
+# discards this non-secret local token and injects the Copilot OAuth token.
+[model_providers.copilot.auth]
+command = "pwsh"
+args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('dummy')"]
+timeout_ms = 5000
+refresh_interval_ms = 0
 '@
 
 # Profile overlay. Codex loads config.toml then overlays this file for
@@ -46,7 +50,7 @@ $profileSnippet = @'
 # copilot-cli-relay Codex profile.
 # Overlaid on ~/.codex/config.toml when you run: codex --profile copilot
 model_provider = "copilot"
-model = "gpt-5.5"
+model = "gpt-5.6-sol"
 model_reasoning_effort = "medium"
 '@
 
@@ -57,12 +61,12 @@ if (-not $Write) {
   Write-Output '# --- ~/.codex/copilot.config.toml (whole file) ---'
   $profileSnippet -split '\r?\n' | ForEach-Object { Write-Output $_ }
   Write-Output ''
-  Write-Output 'To write these files and persist the dummy key, run:'
+  Write-Output 'To write these files, run:'
   Write-Output '  pwsh scripts\codex-config.ps1 -Write'
   exit 0
 }
 
-function Remove-TomlTable {
+function Remove-TomlTableTree {
   param(
     [Parameter(Mandatory)]
     [string]$Text,
@@ -72,7 +76,7 @@ function Remove-TomlTable {
   )
 
   $escaped = [regex]::Escape($TableName)
-  $pattern = "(?ms)^\[$escaped\]\r?\n.*?(?=^\[|\z)"
+  $pattern = "(?ms)^\[$escaped(?:\.[^\]]+)?\]\r?\n.*?(?=^\[|\z)"
   return [regex]::Replace($Text, $pattern, '')
 }
 
@@ -102,7 +106,7 @@ Write-Host "About to update Codex relay setup:" -ForegroundColor Cyan
 Write-Host "  $configPath  (managed copilot provider block)"
 Write-Host "  $profilePath  (copilot profile overlay)"
 Write-Host ''
-Write-Host "This writes a local relay provider/profile plus non-secret dummy CODEX_PROXY_API_KEY."
+Write-Host "This writes a local relay provider/profile and removes the obsolete dummy-key setup."
 Write-Host "Any legacy [profiles.copilot*] tables in config.toml will be removed."
 Write-Host "Type YES to confirm these file and user-environment changes."
 $confirmation = Read-Host 'Confirmation'
@@ -118,7 +122,7 @@ if ($Force) {
 
 # Refresh config.toml: drop the managed provider block plus any legacy profile
 # tables/selector, then re-append the current provider block.
-$updated = Remove-TomlTable -Text $existing -TableName 'model_providers.copilot'
+$updated = Remove-TomlTableTree -Text $existing -TableName 'model_providers.copilot'
 $updated = Remove-LegacyProfileTables -Text $updated
 $updated = $updated.Trim()
 $configText = if ($updated) { $updated + "`r`n`r`n" + $providerSnippet } else { $providerSnippet }
@@ -129,22 +133,18 @@ Write-Host "Refreshed copilot provider in config.toml (legacy profile tables rem
 Set-Content -Path $profilePath -Value $profileSnippet -Encoding UTF8
 Write-Host "Wrote copilot profile to copilot.config.toml." -ForegroundColor Green
 
-[Environment]::SetEnvironmentVariable('CODEX_PROXY_API_KEY', 'dummy', 'User')
-$env:CODEX_PROXY_API_KEY = 'dummy'
-
+# Remove the environment setup written by older versions of this script.
+[Environment]::SetEnvironmentVariable('CODEX_PROXY_API_KEY', $null, 'User')
+Remove-Item Env:CODEX_PROXY_API_KEY -ErrorAction SilentlyContinue
 $psProfilePath = $PROFILE.CurrentUserAllHosts
-$psProfileDir = Split-Path -Parent $psProfilePath
-New-Item -ItemType Directory -Force -Path $psProfileDir | Out-Null
-$profileLine = '$env:CODEX_PROXY_API_KEY = "dummy"'
 if (Test-Path $psProfilePath) {
-  $profileText = Get-Content -Raw -Path $psProfilePath
-  if ($profileText -notmatch 'CODEX_PROXY_API_KEY') {
-    Add-Content -Path $psProfilePath -Value ("`r`n# Local dummy key for copilot-cli-relay Codex profile`r`n" + $profileLine) -Encoding UTF8
+  [string]$profileText = Get-Content -Raw -Path $psProfilePath
+  $legacyPattern = '(?m)^# Local dummy key for copilot-cli-relay Codex profile\r?\n\$env:CODEX_PROXY_API_KEY\s*=\s*["'']dummy["'']\r?\n?'
+  $cleanedProfile = [regex]::Replace($profileText, $legacyPattern, '')
+  if ($cleanedProfile -ne $profileText) {
+    Set-Content -Path $psProfilePath -Value $cleanedProfile.TrimEnd() -Encoding UTF8
   }
-} else {
-  Set-Content -Path $psProfilePath -Value ("# Local dummy key for copilot-cli-relay Codex profile`r`n" + $profileLine) -Encoding UTF8
 }
 
-Write-Host "Persisted CODEX_PROXY_API_KEY for new PowerShell sessions." -ForegroundColor Green
+Write-Host "Removed obsolete CODEX_PROXY_API_KEY setup if present." -ForegroundColor Green
 Write-Host "Start Codex with: codex -p copilot"
-Write-Host "Already-open terminals may still need: `$env:CODEX_PROXY_API_KEY = 'dummy'"
