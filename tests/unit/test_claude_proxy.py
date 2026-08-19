@@ -120,13 +120,6 @@ def test_parse_claude_request_malformed_body_returns_defaults():
     assert streaming is False
 
 
-def test_peek_model_extracts_or_noops():
-    assert claude_proxy_mod._peek_model(b'{"model": "claude-x"}') == "claude-x"
-    assert claude_proxy_mod._peek_model(b'{}') is None
-    assert claude_proxy_mod._peek_model(b'not json{{{') is None  # malformed -> None
-    assert claude_proxy_mod._peek_model(b'[1, 2]') is None  # non-dict root -> None
-
-
 def test_parse_claude_request_non_dict_body_returns_defaults():
     body, model, streaming = claude_proxy_mod._parse_claude_request(b'["a","b"]')
     assert body == b'["a","b"]'
@@ -369,7 +362,7 @@ def test_messages_body_rewrite_applied_before_send():
     )
     assert r.status_code == 200
     assert "reasoning_effort" not in captured["body"]
-    assert captured["body"]["output_config"]["effort"] == "medium"
+    assert captured["body"]["output_config"]["effort"] == "xhigh"
 
 
 def test_messages_non_streaming_error_body_read_failure_still_returns_status(caplog):
@@ -498,21 +491,20 @@ def test_passthrough_response_strips_server_header():
     assert r.headers["x-keep"] == "1"
 
 
-# ---------- 1M context routing ----------
+# ---------- live model capabilities ----------
 
 
 def test_messages_effort_clamped_from_live_caps():
     """End-to-end: with a model_caps cache attached, the effort clamp uses the
-    live /models capabilities. A model the static table doesn't restrict
-    (opus-4.7-1m-internal) but whose live caps allow xhigh must pass xhigh
-    through, proving caps override the static default."""
+    live /models capabilities. A new model whose live caps allow xhigh must
+    pass xhigh through without requiring a static entry."""
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/models":
             return httpx.Response(200, json={
                 "data": [{
-                    "id": "claude-opus-4.7-1m-internal",
+                    "id": "claude-future-6",
                     "vendor": "Anthropic",
                     "capabilities": {
                         "type": "chat",
@@ -527,7 +519,7 @@ def test_messages_effort_clamped_from_live_caps():
     app.state.model_caps = ModelCapabilityCache()
     r = client.post(
         "/claude/v1/messages",
-        json={"model": "claude-opus-4-7-1m-internal", "reasoning_effort": "xhigh", "messages": []},
+        json={"model": "claude-future-6", "reasoning_effort": "xhigh", "messages": []},
     )
     assert r.status_code == 200
     assert "reasoning_effort" not in captured["body"]
@@ -561,34 +553,25 @@ def test_messages_effort_stripped_from_live_caps():
     assert "output_config" not in captured["body"]
 
 
-def test_1m_picker_clamps_effort_against_remapped_model_not_inbound():
-    """Regression for the effort-clamp ordering bug: Claude Code's 1M picker
-    sends inbound model `claude-opus-4-7` (whose live caps allow only medium)
-    plus the context-1m beta, which we remap to `claude-opus-4.7-1m-internal`
-    (which allows xhigh). The effort clamp must key off the FINAL remapped
-    model, so xhigh survives instead of being downgraded to medium."""
+def test_1m_beta_is_stripped_without_remapping_standard_model():
+    """Standard models now expose 1M directly, while Copilot still rejects
+    the obsolete beta token."""
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/models":
             return httpx.Response(200, json={
-                "data": [
-                    {
-                        "id": "claude-opus-4.7",
-                        "vendor": "Anthropic",
-                        "capabilities": {"type": "chat", "supports": {"reasoning_effort": ["medium"]}},
+                "data": [{
+                    "id": "claude-opus-4.7",
+                    "vendor": "Anthropic",
+                    "capabilities": {
+                        "type": "chat",
+                        "supports": {"reasoning_effort": ["low", "medium", "high", "xhigh", "max"]},
                     },
-                    {
-                        "id": "claude-opus-4.7-1m-internal",
-                        "vendor": "Anthropic",
-                        "capabilities": {
-                            "type": "chat",
-                            "supports": {"reasoning_effort": ["low", "medium", "high", "xhigh"]},
-                        },
-                    },
-                ],
+                }],
             })
         captured["body"] = json.loads(request.content)
+        captured["headers"] = dict(request.headers)
         return httpx.Response(200, json={"ok": True})
 
     client, app = _make_client(handler)
@@ -599,181 +582,13 @@ def test_1m_picker_clamps_effort_against_remapped_model_not_inbound():
         json={"model": "claude-opus-4-7", "reasoning_effort": "xhigh", "messages": []},
     )
     assert r.status_code == 200
-    assert captured["body"]["model"] == "claude-opus-4.7-1m-internal"
+    assert captured["body"]["model"] == "claude-opus-4-7"
     assert "reasoning_effort" not in captured["body"]
     assert captured["body"]["output_config"]["effort"] == "xhigh"
-
-
-def test_1m_remap_opus_47_with_beta_routes_to_internal_variant():
-    """Claude Code's 'Opus 4.7 (1M context)' picker tier sends model
-    `claude-opus-4-7` plus `anthropic-beta: context-1m-2025-08-07`. Without
-    a remap the beta gets stripped (Copilot rejects it) and the request
-    silently downgrades to the 200K-context model. We rewrite the model id
-    to the upstream variant whose advertised context window is actually 1M,
-    converting from Claude Code's dash form to the dot form Copilot's
-    /v1/messages requires for these specific ids."""
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        captured["headers"] = dict(request.headers)
-        return httpx.Response(200, json={"ok": True})
-
-    client, _ = _make_client(handler)
-    r = client.post(
-        "/claude/v1/messages",
-        json={"model": "claude-opus-4-7", "messages": []},
-        headers={"anthropic-beta": "context-1m-2025-08-07"},
-    )
-    assert r.status_code == 200
-    # Upstream sees dot form (only form Copilot accepts for -1m ids).
-    assert captured["body"]["model"] == "claude-opus-4.7-1m-internal"
-    # The beta itself is still stripped — upstream rejects it on -1m models too.
     assert "anthropic-beta" not in {k.lower() for k in captured["headers"]}
 
 
-def test_1m_remap_opus_46_with_beta_routes_to_1m_variant():
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
-
-    client, _ = _make_client(handler)
-    client.post(
-        "/claude/v1/messages",
-        json={"model": "claude-opus-4.6", "messages": []},
-        headers={"anthropic-beta": "context-1m-2025-08-07"},
-    )
-    assert captured["body"]["model"] == "claude-opus-4.6-1m"
-
-
-def test_1m_remap_dot_form_model_id_also_remapped():
-    """Claude Code may send dot or dash forms — both must remap to the
-    upstream-accepted dot form (-1m ids reject dash upstream)."""
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
-
-    client, _ = _make_client(handler)
-    client.post(
-        "/claude/v1/messages",
-        json={"model": "Claude-Opus-4.7", "messages": []},  # mixed case + dots
-        headers={"anthropic-beta": "context-1m-2025-08-07, tools-2024-04-04"},
-    )
-    assert captured["body"]["model"] == "claude-opus-4.7-1m-internal"
-
-
-def test_1m_remap_mixed_case_beta_token_remaps_AND_strips():
-    """Regression: detection (claude_proxy.py) and stripping (headers.py) of the
-    1M beta token must agree on case-insensitivity. A mixed-case
-    `Context-1M-2025-08-07` should both trigger the model remap AND get
-    stripped from the outbound headers — otherwise upstream rejects it."""
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        captured["headers"] = dict(request.headers)
-        return httpx.Response(200, json={"ok": True})
-
-    client, _ = _make_client(handler)
-    r = client.post(
-        "/claude/v1/messages",
-        json={"model": "claude-opus-4-7", "messages": []},
-        headers={"anthropic-beta": "Context-1M-2025-08-07"},
-    )
-    assert r.status_code == 200
-    # Model was remapped (detection side) and dash→dot normalized for upstream.
-    assert captured["body"]["model"] == "claude-opus-4.7-1m-internal"
-    # Beta was stripped from outbound (sending side)
-    assert "anthropic-beta" not in {k.lower() for k in captured["headers"]}
-
-
-def test_1m_remap_no_beta_means_no_remap():
-    """Without the 1M beta header, the model id passes through untouched."""
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
-
-    client, _ = _make_client(handler)
-    client.post("/claude/v1/messages", json={"model": "claude-opus-4-7", "messages": []})
-    assert captured["body"]["model"] == "claude-opus-4-7"
-
-
-def test_1m_remap_unknown_model_no_op():
-    """Sonnet has no -1m variant on this tenant — leave the model unchanged
-    so the request still reaches upstream (downgraded to 200K, but at least
-    doesn't 404 on a fictional id)."""
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
-
-    client, _ = _make_client(handler)
-    client.post(
-        "/claude/v1/messages",
-        json={"model": "claude-sonnet-4-6", "messages": []},
-        headers={"anthropic-beta": "context-1m-2025-08-07"},
-    )
-    assert captured["body"]["model"] == "claude-sonnet-4-6"
-
-
-def test_1m_remap_user_already_picked_1m_id_directly():
-    """User typed `/model claude-opus-4-7-1m-internal` (dash, what
-    /v1/models advertises and what Claude Code's /model validates against).
-    No beta header, no remap needed — but the dash→dot upstream conversion
-    MUST still fire so Copilot doesn't reject with 'model_not_supported'."""
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
-
-    client, _ = _make_client(handler)
-    client.post(
-        "/claude/v1/messages",
-        json={"model": "claude-opus-4-7-1m-internal", "messages": []},
-    )
-    # Dash in (from Claude Code), dot out (what Copilot accepts).
-    assert captured["body"]["model"] == "claude-opus-4.7-1m-internal"
-
-
-def test_1m_dash_to_dot_normalization_for_opus_46_1m():
-    """Same dash→dot guarantee for the Opus 4.6 -1m variant."""
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
-
-    client, _ = _make_client(handler)
-    client.post("/claude/v1/messages", json={"model": "claude-opus-4-6-1m", "messages": []})
-    assert captured["body"]["model"] == "claude-opus-4.6-1m"
-
-
-def test_no_dash_to_dot_normalization_for_non_1m_models():
-    """Dash form is preserved for non-1m models — upstream accepts both
-    dash and dot for those, no need to mutate."""
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
-
-    client, _ = _make_client(handler)
-    client.post("/claude/v1/messages", json={"model": "claude-sonnet-4-6", "messages": []})
-    assert captured["body"]["model"] == "claude-sonnet-4-6"  # unchanged
-
-
-def test_dash_to_dot_normalization_handles_future_1m_variants():
-    """Future-proof: a hypothetical `claude-sonnet-4-6-1m` (no -internal) and
-    `claude-haiku-4-5-1m-internal` should be auto-converted to dot form
-    upstream by the generic regex, without needing a table update."""
+def test_retired_1m_model_ids_map_to_standard_replacements():
     captured = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -781,52 +596,13 @@ def test_dash_to_dot_normalization_handles_future_1m_variants():
         return httpx.Response(200, json={"ok": True})
 
     client, _ = _make_client(handler)
-    for dashed in ("claude-sonnet-4-6-1m", "claude-haiku-4-5-1m-internal"):
-        client.post("/claude/v1/messages", json={"model": dashed, "messages": []})
-    assert captured == ["claude-sonnet-4.6-1m", "claude-haiku-4.5-1m-internal"]
-
-
-def test_to_upstream_dot_form_unit():
-    """Direct unit coverage of the version-segment dash→dot helper."""
-    f = claude_proxy_mod._to_upstream_dot_form
-    assert f("claude-opus-4-7-1m-internal") == "claude-opus-4.7-1m-internal"
-    assert f("claude-opus-4-6-1m") == "claude-opus-4.6-1m"
-    # Dot-form input is rejected by the regex (it requires dash-form version
-    # segments). _normalize_model_for_upstream's `target is None` branch then
-    # treats it as a no-op, which is correct: dot form is what upstream wants.
-    assert f("claude-opus-4.7-1m-internal") is None
-    # Non-1m ids: not recognized.
-    assert f("claude-opus-4-7") is None
-    assert f("claude-sonnet-4-6") is None
-    # Single-digit families still work.
-    assert f("claude-opus-10-2-1m") == "claude-opus-10.2-1m"
-
-
-def test_normalize_model_for_upstream_defensive_paths():
-    """Direct unit coverage of _normalize_model_for_upstream's safety guards
-    for non-string inputs and malformed JSON bodies."""
-    f = claude_proxy_mod._normalize_model_for_upstream
-    # Non-string model_id → no-op
-    out, m, mut = f(b'{"model": null}', None)
-    assert (out, m, mut) == (b'{"model": null}', None, False)
-    # Recognized -1m id but malformed JSON body → no-op (defensive)
-    out, m, mut = f(b"not json{{", "claude-opus-4-7-1m-internal")
-    assert mut is False and m == "claude-opus-4-7-1m-internal"
-
-
-def test_remap_to_1m_defensive_paths():
-    """Direct unit coverage of _remap_to_1m's safety guards: non-string
-    model_id, malformed JSON body, and non-dict JSON root all return the
-    inputs unchanged with mutated=False."""
-    # Non-string model_id (e.g. None upstream of a malformed inbound).
-    out, m, mut = claude_proxy_mod._remap_to_1m(b'{"model": null}', None)
-    assert (out, m, mut) == (b'{"model": null}', None, False)
-    # Malformed JSON body (shouldn't happen post _parse_claude_request, but defended).
-    out, m, mut = claude_proxy_mod._remap_to_1m(b"not json{{", "claude-opus-4-7")
-    assert mut is False and m == "claude-opus-4-7"
-    # JSON root that isn't a dict.
-    out, m, mut = claude_proxy_mod._remap_to_1m(b'["arr"]', "claude-opus-4-7")
-    assert mut is False and m == "claude-opus-4-7"
+    for model in ("claude-opus-4-7-1m-internal", "claude-opus-4.6-1m"):
+        response = client.post(
+            "/claude/v1/messages",
+            json={"model": model, "messages": []},
+        )
+        assert response.status_code == 200
+    assert captured == ["claude-opus-4-7", "claude-opus-4.6"]
 
 
 def test_messages_non_streaming_timeout():
@@ -1507,14 +1283,13 @@ def test_messages_streaming_mid_stream_error_yields_sse_error_frame(caplog):
 # ---------- /v1/messages effort rewrite (case-insensitivity) ----------
 
 def test_effort_override_is_case_insensitive():
-    """`Claude-Opus-4.7` (mixed case) must still hit the override and clamp
-    `high`->`medium`, relocating into output_config.effort."""
+    """A mixed-case model id still hits the static fallback."""
     body, _model, _stream = claude_proxy_mod._parse_claude_request(
         json.dumps({"model": "Claude-Opus-4.7", "reasoning_effort": "high"}).encode()
     )
     out = json.loads(body)
     assert "reasoning_effort" not in out
-    assert out["output_config"]["effort"] == "medium"
+    assert out["output_config"]["effort"] == "high"
 
 
 # ---------- /v1/messages response: multi-valued headers ----------
@@ -1607,14 +1382,12 @@ def test_models_filters_and_canonicalizes():
         # Picker disabled.
         {"id": "claude-sonnet-4.5", "name": "Claude Sonnet 4.5", "vendor": "Anthropic",
          "capabilities": {"type": "chat"}, "model_picker_enabled": False},
-        # -1m variant: kept (real 1M context window upstream — hiding it would
-        # block the only path to 1M on this tenant).
+        # Retired internal-only variants are excluded.
         {"id": "claude-opus-4.6-1m", "name": "Claude Opus 4.6 (1M context)(Internal only)",
          "vendor": "Anthropic", "capabilities": {"type": "chat"}},
         {"id": "claude-opus-4.7-1m-internal", "name": "Claude Opus 4.7 (1M context)(Internal only)",
          "vendor": "Anthropic", "capabilities": {"type": "chat"}},
-        # Internal-only WITHOUT a -1m id: still excluded (these are MS-private
-        # experiments without the redeeming 1M-context window).
+        # Other internal-only experiments are excluded too.
         {"id": "claude-secret", "name": "Claude Secret (Internal Only)", "vendor": "Anthropic",
          "capabilities": {"type": "chat"}},
         # Duplicate of first — deduped.
@@ -1633,11 +1406,9 @@ def test_models_filters_and_canonicalizes():
     assert ids == [
         "claude-sonnet-4-6",
         "claude-opus-4-7",
-        "claude-opus-4-6-1m",
-        "claude-opus-4-7-1m-internal",
     ]
     assert body["first_id"] == "claude-sonnet-4-6"
-    assert body["last_id"] == "claude-opus-4-7-1m-internal"
+    assert body["last_id"] == "claude-opus-4-7"
     assert body["has_more"] is False
     # display_name defaults from name when present.
     assert body["data"][0]["display_name"] == "Claude Sonnet 4.6"

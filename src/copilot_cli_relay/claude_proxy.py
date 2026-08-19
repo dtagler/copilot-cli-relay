@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 import uuid
-from collections.abc import Mapping
 from typing import Any
 
 import httpx
@@ -80,35 +78,27 @@ def _anthropic_kind_for_status(status: int) -> str:
 # Models NOT listed accept the standard {low, medium, high}.
 # Keys cover both dot and dash forms — Claude Code may send either; Copilot accepts both.
 _EFFORT_OVERRIDES: dict[str, set[str] | None] = {
-    # Opus 4.8 and 4.7 currently only accept "medium" (verified upstream via
-    # /models capabilities.supports.reasoning_effort == ["medium"]).
-    "claude-opus-4.8": {"medium"},
-    "claude-opus-4-8": {"medium"},
-    "claude-opus-4.7": {"medium"},
-    "claude-opus-4-7": {"medium"},
+    "claude-opus-5": {"low", "medium", "high", "xhigh", "max"},
+    "claude-opus-4.8": {"low", "medium", "high", "xhigh", "max"},
+    "claude-opus-4-8": {"low", "medium", "high", "xhigh", "max"},
+    "claude-opus-4.7": {"low", "medium", "high", "xhigh", "max"},
+    "claude-opus-4-7": {"low", "medium", "high", "xhigh", "max"},
+    "claude-opus-4.6": {"low", "medium", "high", "max"},
+    "claude-opus-4-6": {"low", "medium", "high", "max"},
+    "claude-sonnet-5": {"low", "medium", "high", "xhigh", "max"},
+    "claude-sonnet-4.6": {"low", "medium", "high", "max"},
+    "claude-sonnet-4-6": {"low", "medium", "high", "max"},
     # Haiku doesn't support reasoning effort at all — strip the field.
     "claude-haiku-4.5": None,
     "claude-haiku-4-5": None,
 }
 _DEFAULT_EFFORT_VALUES = {"low", "medium", "high"}
-
-
-# Standard model id → upstream's -1m variant id, used when the client signals
-# 1M-context intent via the `context-1m-2025-08-07` anthropic-beta header.
-# Upstream advertises only Opus 4.6 and 4.7 in -1m form (verified via
-# /models capabilities.limits.max_context_window_tokens=1_000_000); other
-# Anthropic models cap at 200K and have no -1m variant on this tenant.
-# Keys cover both dot and dash inbound forms — Claude Code may send either.
-# Values use DASH form (what Claude Code's `/model` validation accepts);
-# the dash→dot conversion required by Copilot's /v1/messages happens later
-# in `_normalize_model_for_upstream`.
-_MODEL_1M_REWRITES: dict[str, str] = {
-    "claude-opus-4.7": "claude-opus-4-7-1m-internal",
-    "claude-opus-4-7": "claude-opus-4-7-1m-internal",
-    "claude-opus-4.6": "claude-opus-4-6-1m",
-    "claude-opus-4-6": "claude-opus-4-6-1m",
+_RETIRED_MODEL_REPLACEMENTS = {
+    "claude-opus-4.7-1m-internal": "claude-opus-4.7",
+    "claude-opus-4-7-1m-internal": "claude-opus-4-7",
+    "claude-opus-4.6-1m": "claude-opus-4.6",
+    "claude-opus-4-6-1m": "claude-opus-4-6",
 }
-_BETA_1M_TOKEN = "context-1m-2025-08-07"
 
 
 def _normalize_effort(value: Any, allowed: set[str]) -> str:
@@ -249,107 +239,6 @@ def _apply_effort_rewrite(parsed: dict, caps: EffortCaps | None = None) -> tuple
     return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False).encode("utf-8"), mutated
 
 
-def _client_wants_1m_context(headers: Mapping[str, str]) -> bool:
-    """True if the inbound request carries the Anthropic 1M-context beta token.
-
-    Claude Code's hardcoded 'Sonnet (1M context)' / 'Opus 4.7 (1M context)'
-    picker tiers attach `anthropic-beta: context-1m-2025-08-07` and send the
-    standard model id. Copilot rejects that beta on standard ids and we strip
-    it in headers.py — so without an extra hop, those picker tiers silently
-    downgrade to 200K context. Detecting the intent here lets `_remap_to_1m`
-    swap the model id to upstream's actual 1M-capable variant.
-    """
-    for k, v in headers.items():
-        if k.lower() != "anthropic-beta":
-            continue
-        if any(t.strip().lower() == _BETA_1M_TOKEN for t in v.split(",")):
-            return True
-    return False
-
-
-def _swap_model_in_body(body: bytes, new_model: str) -> tuple[bytes, str | None]:
-    """Re-serialize the request body with the `model` field replaced.
-
-    Returns (new_body, new_model). On any structural problem (malformed JSON,
-    non-dict root) returns (original body, None) so the caller can no-op.
-    """
-    try:
-        parsed = json.loads(body)
-    except (ValueError, TypeError):
-        return body, None
-    if not isinstance(parsed, dict):
-        return body, None
-    parsed["model"] = new_model
-    new_body = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return new_body, new_model
-
-
-def _remap_to_1m(body: bytes, model_id: str | None) -> tuple[bytes, str | None, bool]:
-    """If `model_id` has a known -1m variant, rewrite the body to use it.
-
-    Returns (new_body, new_model_id, mutated). When the model isn't in the
-    rewrite table — e.g. Sonnet variants, where upstream has no -1m form on
-    this tenant — returns the original body unchanged and the call is a no-op.
-    The output id is in DASH form (what Claude Code's `/model` accepts);
-    `_normalize_model_for_upstream` later converts it to the dot form
-    Copilot's /v1/messages requires.
-    """
-    if not isinstance(model_id, str):
-        return body, model_id, False
-    target = _MODEL_1M_REWRITES.get(model_id.lower())
-    if not target:
-        return body, model_id, False
-    new_body, new_model = _swap_model_in_body(body, target)
-    if new_model is None:
-        return body, model_id, False
-    return new_body, new_model, True
-
-
-def _normalize_model_for_upstream(body: bytes, model_id: str | None) -> tuple[bytes, str | None, bool]:
-    """Apply the dash→dot conversion required for any -1m / -1m-internal id.
-
-    `/claude/v1/models` advertises ids in canonical Anthropic dash form because
-    Claude Code's `/model` slash command validates against that form. But
-    Copilot's `/v1/messages` rejects the dash form for `-1m` ids
-    ("model_not_supported") and only accepts the dot form. We do this as
-    the last hop before forwarding so the user-visible id always stays dash.
-
-    Generic conversion: turn the version-segment hyphens (e.g. `-4-7-`) into
-    a dot (`-4.7-`) for any id matching `*-N-N-1m*`. Future upstream additions
-    like `claude-sonnet-4-6-1m` will be handled without table updates. Other
-    models pass through unchanged (upstream accepts dash and dot for them).
-    """
-    if not isinstance(model_id, str):
-        return body, model_id, False
-    target = _to_upstream_dot_form(model_id)
-    if target is None or target == model_id:
-        return body, model_id, False
-    new_body, new_model = _swap_model_in_body(body, target)
-    if new_model is None:
-        return body, model_id, False
-    return new_body, new_model, True
-
-
-# Match an Anthropic id of the form `claude-<family>-<major>-<minor>-1m...`
-# in dash form. Group 1 is the prefix up to (and including) the version-segment
-# hyphen, group 2 is the major.minor pair as `N-N`, group 3 is the suffix
-# starting at the `-1m` marker.
-_DASH_1M_VERSION_RE = re.compile(r"^(claude-[a-z]+-)(\d+)-(\d+)(-1m\b.*)$", re.IGNORECASE)
-
-
-def _to_upstream_dot_form(model_id: str) -> str | None:
-    """If `model_id` is a dash-form -1m id, return the dot-form Copilot needs.
-
-    Returns None if the id isn't a recognized -1m shape; callers should treat
-    that as "leave alone". Returns `model_id` unchanged if the version segment
-    is already dot form (e.g. user typed `claude-opus-4.7-1m-internal`).
-    """
-    m = _DASH_1M_VERSION_RE.match(model_id)
-    if not m:
-        return None
-    return f"{m.group(1)}{m.group(2)}.{m.group(3)}{m.group(4)}"
-
-
 async def _get_caps_snapshot(request: Request) -> EffortCaps | None:
     """Best-effort fetch of the upstream effort-capability snapshot.
 
@@ -365,47 +254,31 @@ async def _get_caps_snapshot(request: Request) -> EffortCaps | None:
     return await cache.get(client, get_settings())
 
 
-def _peek_model(body: bytes) -> str | None:
-    """Read the `model` field without mutating or re-serializing the body.
-
-    Used to drive the 1M remap before reasoning-effort clamping; returns None
-    on malformed JSON or a non-dict root so callers no-op.
-    """
+def _replace_retired_model(body: bytes) -> bytes:
+    """Map formerly documented internal 1M ids to standard 1M-capable ids."""
     try:
         parsed = json.loads(body)
     except (ValueError, TypeError):
-        return None
-    return parsed.get("model") if isinstance(parsed, dict) else None
+        return body
+    if not isinstance(parsed, dict):
+        return body
+    model = parsed.get("model")
+    if not isinstance(model, str):
+        return body
+    replacement = _RETIRED_MODEL_REPLACEMENTS.get(model.lower())
+    if replacement is None:
+        return body
+    parsed["model"] = replacement
+    return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 async def proxy_claude_messages(request: Request) -> Response:
     settings = get_settings()
     client: httpx.AsyncClient = request.app.state.http_client
 
-    raw_body = await request.body()
+    raw_body = _replace_retired_model(await request.body())
     caps = await _get_caps_snapshot(request)
-    # Finalize the upstream model id (1M beta remap, then dash->dot) BEFORE
-    # clamping reasoning-effort, so the clamp keys off the model actually being
-    # invoked. Claude Code's 1M picker tier sends e.g. `claude-opus-4-7` + the
-    # context-1m beta header but the request really runs on
-    # `claude-opus-4.7-1m-internal`, which advertises a wider effort set — so
-    # clamping against the inbound id would wrongly downgrade. The remap and
-    # normalize steps only ever rewrite the `model` field, never effort.
-    body = raw_body
-    model_id = _peek_model(raw_body)
-    if _client_wants_1m_context(request.headers):
-        body, new_model_id, remapped = _remap_to_1m(body, model_id)
-        if remapped:
-            logger.debug(
-                "1M context remap: %s -> %s (anthropic-beta %s)",
-                model_id, new_model_id, _BETA_1M_TOKEN,
-            )
-            model_id = new_model_id
-    # Last hop before upstream: convert -1m ids from the dash form Claude Code
-    # uses (and we advertise in /claude/v1/models) to the dot form Copilot requires.
-    body, model_id, _ = _normalize_model_for_upstream(body, model_id)
-    # Clamp reasoning-effort last, keyed on the finalized model id.
-    body, model_id, streaming = _parse_claude_request(body, caps=caps)
+    body, model_id, streaming = _parse_claude_request(raw_body, caps=caps)
     request_id = str(uuid.uuid4())
     model = model_id or "?"
     started = time.monotonic()
@@ -719,23 +592,13 @@ async def proxy_claude_models(request: Request) -> Response:
         # in the picker, and Copilot rejects it.
         name_raw = m.get("name")
         name = name_raw if isinstance(name_raw, str) else ""
-        # Hide internal/preview variants whose name shouts "internal only" but
-        # KEEP the -1m / -1m-internal id-suffix variants — those are the only
-        # way to actually get 1M context on this Copilot tenant (verified via
-        # /models limits.max_context_window_tokens=1_000_000). Hiding them
-        # would make `/model claude-opus-4-7-1m-internal` fail at the picker
-        # layer and force users back to the silently-downgrading 200K path.
-        # Claude Code's auto-attached `context-1m-2025-08-07` beta header is
-        # still rejected by Copilot, but headers.py strips it (and proxy_claude_messages
-        # remaps the model id when the beta is present, see _remap_to_1m).
-        if "internal only" in name.lower() and not (mid.endswith("-1m") or mid.endswith("-1m-internal")):
+        # Standard picker models advertise their full context windows directly.
+        # Internal-only variants are not valid for this integration.
+        if "internal only" in name.lower():
             continue
         # Normalize id to canonical Anthropic dash form (claude-opus-4.7 →
         # claude-opus-4-7). Claude Code recognizes this format and validates
-        # `/model` arguments against it. For -1m / -1m-internal ids upstream
-        # actually requires the dot form; we restore that just before
-        # forwarding via _normalize_model_for_upstream so the user-facing id
-        # stays dash everywhere Claude Code touches it.
+        # `/model` arguments against it.
         canonical_id = mid.replace(".", "-")
         # Dedup post-canonicalization so that upstream returning both dot and
         # dash forms of the same model doesn't yield duplicate ids downstream.

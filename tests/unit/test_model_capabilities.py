@@ -39,7 +39,7 @@ def _models_payload() -> dict:
                 "capabilities": {"type": "chat", "supports": {"reasoning_effort": ["medium"]}},
             },
             {
-                "id": "claude-opus-4.7-1m-internal",
+                "id": "claude-future-6",
                 "vendor": "Anthropic",
                 "capabilities": {
                     "type": "chat",
@@ -91,10 +91,8 @@ def test_snapshot_malformed_payload_is_empty():
 
 
 def test_resolve_prefers_live_caps_over_static_table():
-    # Static table clamps opus-4.7-1m-internal to default {low,medium,high}
-    # (no entry); live caps say xhigh is allowed, which must win.
-    caps = {"claude-opus-4.7-1m-internal": {"low", "medium", "high", "xhigh"}}
-    assert _resolve_allowed_efforts("claude-opus-4.7-1m-internal", caps) == {
+    caps = {"claude-future-6": {"low", "medium", "high", "xhigh"}}
+    assert _resolve_allowed_efforts("claude-future-6", caps) == {
         "low", "medium", "high", "xhigh",
     }
 
@@ -105,11 +103,13 @@ def test_resolve_live_caps_none_means_strip():
 
 def test_resolve_falls_back_to_static_when_model_absent_from_caps():
     # Model not in the (otherwise populated) snapshot -> static table applies.
-    assert _resolve_allowed_efforts("claude-opus-4.8", {"other": {"low"}}) == {"medium"}
+    assert _resolve_allowed_efforts("claude-opus-4.8", {"other": {"low"}}) == {
+        "low", "medium", "high", "xhigh", "max",
+    }
 
 
 def test_resolve_defaults_when_unknown_everywhere():
-    assert _resolve_allowed_efforts("claude-sonnet-4.6", None) == {"low", "medium", "high"}
+    assert _resolve_allowed_efforts("claude-future-6", None) == {"low", "medium", "high"}
 
 
 def test_resolve_case_insensitive():
@@ -125,8 +125,8 @@ def _rt(body: dict, caps=None) -> dict:
 
 
 def test_parse_caps_allow_xhigh_passes_through():
-    caps = {"claude-opus-4.7-1m-internal": {"low", "medium", "high", "xhigh"}}
-    out = _rt({"model": "claude-opus-4.7-1m-internal", "reasoning_effort": "xhigh"}, caps=caps)
+    caps = {"claude-future-6": {"low", "medium", "high", "xhigh"}}
+    out = _rt({"model": "claude-future-6", "reasoning_effort": "xhigh"}, caps=caps)
     assert out["output_config"]["effort"] == "xhigh"
 
 

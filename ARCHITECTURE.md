@@ -86,11 +86,10 @@ Tests mirror that under `tests/unit/`.
 2. **Rewrite the body for Copilot.** Two massaging steps run before forwarding:
    - `_apply_thinking_rewrite` converts `thinking: {type: "enabled", budget_tokens: N}` (the legacy extended-thinking shape Claude Code sends) into `thinking: {type: "adaptive"}` and drops `budget_tokens`. Copilot's Anthropic endpoint now rejects `thinking.type.enabled` outright ("Use thinking.type.adaptive and output_config.effort") and rejects `budget_tokens` under adaptive. Other thinking types (`disabled`, already-`adaptive`) pass through.
    - `_apply_effort_rewrite` first **relocates** any top-level `reasoning_effort` into `output_config.effort` — Copilot no longer accepts the top-level field at all ("Extra inputs are not permitted"); `output_config.effort` is the live control surface (an existing `output_config.effort` wins if both are present). It then clamps that value to the set each model accepts. The allowed set is resolved by `_resolve_allowed_efforts` with this precedence: **live upstream `/models` capabilities** (`capabilities.supports.reasoning_effort`, cached by `ModelCapabilityCache` in `model_capabilities.py`) → the static `_EFFORT_OVERRIDES` fallback (used only when `/models` is unreachable) → the default `{low, medium, high}`. Examples (current upstream advertisement):
-   - Opus 4.8 / Opus 4.7 → only `medium`; `high`/`low`/`xhigh` are downgraded to `medium`.
-   - Haiku 4.5 / Opus 4.5 / Sonnet 4.5 → no `reasoning_effort` advertised, so the effort field is *removed* (not clamped).
-   - Opus 4.7 `-1m-internal` → advertises `low|medium|high|xhigh`, so `xhigh` is preserved (the static table would have wrongly clamped it).
+   - Current Opus and Sonnet models advertise `low|medium|high|max`; Opus 4.7, Opus 4.8, Opus 5, and Sonnet 5 also advertise `xhigh`.
+   - Haiku 4.5 does not advertise `reasoning_effort`, so the effort field is *removed* (not clamped).
    - A non-string top-level `reasoning_effort` (can't become an `output_config.effort` string) is dropped rather than forwarded into a guaranteed 400; empty `output_config` after stripping is dropped entirely.
-   Because the allowed set comes from upstream, a new or changed model needs **no code change** — the cache picks it up (TTL ~5 min, single-flight refresh, never fails an in-flight request). The effort clamp runs *after* the 1M model remap (step below) so it keys off the final model id.
+   Because the allowed set comes from upstream, a new or changed model needs **no code change** — the cache picks it up (TTL ~5 min, single-flight refresh, never fails an in-flight request).
 3. **Build outbound headers.** `build_claude_outbound_headers` (in `headers.py`):
    - Strips RFC 7230 §6.1 hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Trailers`, `Transfer-Encoding`, `Upgrade`) plus `Host`, `Content-Length`.
    - **Strips inbound `Authorization`, `x-api-key`, `User-Agent`, `Cookie`, `proxy-authorization`** (any client-supplied auth or session state must NEVER reach upstream — this is a security invariant with regression tests). Upstream `Set-Cookie` is dropped on the way back.
@@ -165,10 +164,10 @@ Key invariants:
 - **Vendor filter:** keeps only `vendor == "Anthropic"` (case-insensitive).
 - **Capability filter:** keeps only `capabilities.type == "chat"`.
 - **Picker filter:** drops models with `model_picker_enabled: false`.
-- **Hide internal-only experiments without 1M context:** drops models whose name contains "internal only" *unless* the id ends in `-1m` / `-1m-internal`. The 1M-context variants happen to also be flagged "(Internal only)" by upstream — keeping them is the only way to actually get 1M context on this Copilot tenant (verified via `capabilities.limits.max_context_window_tokens=1_000_000`).
-- **Canonicalize ids:** dot form -> dash form (`claude-opus-4.7` -> `claude-opus-4-7`) - *every* id, including `-1m`. Claude Code's `/model` slash command and built-in name recognition both validate against the canonical dash form, so anything we expose has to be in that shape. The dash-to-dot conversion that Copilot's `/v1/messages` requires for `-1m` ids ("model_not_supported" otherwise) is applied as a last hop in `_normalize_model_for_upstream`, so the user-facing id stays dash everywhere Claude Code touches it.
+- **Hide internal-only experiments:** drops models whose name contains "internal only". Standard picker models now advertise their full context windows directly.
+- **Canonicalize ids:** dot form -> dash form (`claude-opus-4.7` -> `claude-opus-4-7`). Claude Code's `/model` slash command and built-in name recognition validate against the canonical dash form.
 - **Defensive parsing:** non-JSON `200` bodies (captive portals, stray HTML) are caught and returned as a `502 api_error` envelope rather than 500-ing. Each model item is also `isinstance`-checked field-by-field so a malformed-but-valid-JSON shape from upstream can't `AttributeError` past the error envelope.
-- **1M context routing:** see `_remap_to_1m` in `proxy_claude_messages` - when the inbound request carries `anthropic-beta: context-1m-2025-08-07` (Claude Code's hardcoded "Opus 4.7 (1M context)" picker tier) and the model is one of `claude-opus-4-7` / `claude-opus-4-6` (or their dot forms), the body's `model` is rewritten to upstream's `claude-opus-4-7-1m-internal` / `claude-opus-4-6-1m` variant (still dash; the dash-to-dot wire conversion happens in `_normalize_model_for_upstream`). The beta header itself is still stripped in `headers.py` because Copilot rejects it on every model id; the `-1m` model id is the real 1M switch. Without this remap, those picker tiers would silently downgrade to 200K context.
+- **1M context:** standard Opus and Sonnet models advertise 1M context directly. The obsolete `context-1m-2025-08-07` beta token is stripped because Copilot rejects it. Previously documented internal `-1m` ids are translated to their standard replacements for configuration compatibility.
 
 The response uses Anthropic's standard list envelope (`data`, `has_more`, `first_id`, `last_id`).
 
@@ -240,7 +239,7 @@ Runtime config comes from environment variables. `config.py:Settings.from_env()`
     </tr>
     <tr>
       <td width="320"><code>COPILOT_EDITOR_VERSION</code></td>
-      <td><code>copilot-cli-relay/0.4.0</code></td>
+      <td><code>copilot-cli-relay/0.4.1</code></td>
       <td>Sent as <code>Editor-Version</code> and <code>User-Agent</code>.</td>
     </tr>
     <tr>

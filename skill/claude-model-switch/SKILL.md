@@ -11,14 +11,12 @@ Switch between Claude Code models using the built-in `/model` command. Present C
 
 | Shorthand     | Model ID                          | Context  |
 |---------------|-----------------------------------|----------|
-| opus-4.8      | `claude-opus-4-8`                | 200K     |
-| opus-4.7-1m   | `claude-opus-4-7-1m-internal`     | 1M       |
-| opus-4.6-1m   | `claude-opus-4-6-1m`             | 1M       |
-| opus-4.7      | `claude-opus-4-7`                | 200K     |
-| opus-4.6      | `claude-opus-4-6`                | 200K     |
-| opus-4.5      | `claude-opus-4-5`                | 200K     |
-| sonnet-4.6    | `claude-sonnet-4-6`              | 200K     |
-| sonnet-4.5    | `claude-sonnet-4-5`              | 200K     |
+| opus-5        | `claude-opus-5`                  | 1M       |
+| opus-4.8      | `claude-opus-4-8`                | 1M       |
+| opus-4.7      | `claude-opus-4-7`                | 1M       |
+| opus-4.6      | `claude-opus-4-6`                | 1M       |
+| sonnet-5      | `claude-sonnet-5`                | 1M       |
+| sonnet-4.6    | `claude-sonnet-4-6`              | 1M       |
 | haiku-4.5     | `claude-haiku-4-5`               | 200K     |
 
 ## Behavior
@@ -33,17 +31,15 @@ When the user invokes this skill:
 
 Accept flexible shorthands. Strip dots, dashes, and spaces, then match case-insensitively:
 
+- `opus5`, `opus-5`, `opus 5` → `claude-opus-5`
 - `opus48`, `opus-4.8`, `opus 4.8` → `claude-opus-4-8`
 - `opus47`, `opus-4.7`, `opus 4.7` → `claude-opus-4-7`
-- `opus47-1m`, `opus-4.7-1m`, `opus471m` → `claude-opus-4-7-1m-internal`
 - `opus46`, `opus-4.6`, `opus 4.6` → `claude-opus-4-6`
-- `opus46-1m`, `opus-4.6-1m`, `opus461m` → `claude-opus-4-6-1m`
-- `opus45`, `opus-4.5` → `claude-opus-4-5`
+- `sonnet5`, `sonnet-5`, `sonnet 5` → `claude-sonnet-5`
 - `sonnet46`, `sonnet-4.6` → `claude-sonnet-4-6`
-- `sonnet45`, `sonnet-4.5` → `claude-sonnet-4-5`
 - `haiku45`, `haiku-4.5` → `claude-haiku-4-5`
-- Just `opus` → default to `claude-opus-4-8` (latest Opus)
-- Just `sonnet` → default to `claude-sonnet-4-6` (latest Sonnet)
+- Just `opus` → default to `claude-opus-5` (latest Opus)
+- Just `sonnet` → default to `claude-sonnet-5` (latest Sonnet)
 - Just `haiku` → default to `claude-haiku-4-5` (latest Haiku)
 
 ## Important

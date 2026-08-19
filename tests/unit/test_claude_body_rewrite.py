@@ -13,9 +13,9 @@ def test_xhigh_clamped_to_high_for_default_models():
     assert out["output_config"]["effort"] == "high"
 
 
-def test_opus_47_clamps_high_to_medium():
+def test_opus_47_keeps_high():
     out = _rt({"model": "claude-opus-4.7", "output_config": {"effort": "high"}})
-    assert out["output_config"]["effort"] == "medium"
+    assert out["output_config"]["effort"] == "high"
 
 
 def test_opus_47_relocates_and_clamps_top_level_reasoning_effort():
@@ -23,19 +23,18 @@ def test_opus_47_relocates_and_clamps_top_level_reasoning_effort():
     # into output_config.effort and clamped to the model's accepted set.
     out = _rt({"model": "claude-opus-4.7", "reasoning_effort": "xhigh"})
     assert "reasoning_effort" not in out
-    assert out["output_config"]["effort"] == "medium"
+    assert out["output_config"]["effort"] == "xhigh"
 
 
-def test_opus_48_clamps_high_to_medium():
-    # Opus 4.8 advertises reasoning_effort == ["medium"] upstream, same as 4.7.
+def test_opus_48_keeps_high():
     out = _rt({"model": "claude-opus-4.8", "output_config": {"effort": "high"}})
-    assert out["output_config"]["effort"] == "medium"
+    assert out["output_config"]["effort"] == "high"
 
 
-def test_opus_48_dash_form_relocates_and_clamps_low_to_medium():
+def test_opus_48_dash_form_relocates_and_keeps_low():
     out = _rt({"model": "claude-opus-4-8", "reasoning_effort": "low"})
     assert "reasoning_effort" not in out
-    assert out["output_config"]["effort"] == "medium"
+    assert out["output_config"]["effort"] == "low"
 
 
 def test_top_level_reasoning_effort_relocated_to_output_config():
