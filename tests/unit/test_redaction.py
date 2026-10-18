@@ -181,11 +181,14 @@ def test_redacts_google_api_key():
     assert "AIza***REDACTED***" in out
 
 
-def test_redact_bytes_returns_body_if_redaction_fails(monkeypatch):
-    body = b"not-secret"
+def test_redact_bytes_omits_body_if_redaction_fails(monkeypatch):
+    body = b'{"password":"synthetic-secret"}'
 
     def fail_redaction(text):
-        raise RuntimeError("redaction failure")
+        raise RuntimeError("synthetic-error-detail")
 
     monkeypatch.setattr(logging_setup, "redact_text", fail_redaction)
-    assert logging_setup.redact_bytes(body) == body
+    safe = logging_setup.redact_bytes(body)
+    assert b"omitted" in safe
+    assert b"synthetic-secret" not in safe
+    assert b"synthetic-error-detail" not in safe

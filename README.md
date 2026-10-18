@@ -8,16 +8,18 @@
   <a href="https://github.com/features/copilot"><img src="https://cdn.simpleicons.org/githubcopilot/8957E5" alt="GitHub Copilot" width="18" height="18" align="absmiddle"> GitHub Copilot</a>
   &nbsp;·&nbsp;
   <a href="https://github.com/openai/codex"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/openai-logo-dark.svg"><source media="(prefers-color-scheme: light)" srcset="assets/openai-logo-light.svg"><img src="assets/openai-logo-light.svg" alt="OpenAI" width="18" height="18" align="absmiddle"></picture> OpenAI Codex CLI</a>
+  &nbsp;·&nbsp;
+  <a href="https://learn.chatgpt.com/docs/app">ChatGPT desktop app (Codex)</a>
 </p>
 
 <p align="center">
-  <em>A small Python reverse proxy that lets <strong>Claude Code</strong> and <strong>Codex CLI</strong> talk to <strong>GitHub Copilot</strong> - swap the auth header, keep the native protocols. No separate Anthropic or OpenAI API key needed.</em>
+  <em>A small Python reverse proxy for <strong>Claude Code</strong>, <strong>Codex CLI</strong>, and <strong>Codex in the ChatGPT desktop app</strong>, backed by <strong>GitHub Copilot</strong>. Native protocols, relay-managed authentication, no separate Anthropic or OpenAI API key.</em>
 </p>
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/python-3.14+-blue?logo=python&logoColor=white">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-257%20passing-brightgreen?logo=pytest&logoColor=white">
-  <img alt="Coverage" src="https://img.shields.io/badge/coverage-100%25-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-478%20passing-brightgreen?logo=pytest&logoColor=white">
+  <img alt="Coverage" src="https://img.shields.io/badge/coverage-99%25-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?logo=windows11&logoColor=white">
 </p>
@@ -32,9 +34,9 @@
 
 ---
 
-> ## ⚠️ Disclaimer
+> ## Disclaimer
 >
-> **Unofficial, unsupported, proof-of-concept.** This project is an independent experiment and is **not affiliated with, endorsed by, or supported by Microsoft, GitHub, or Anthropic**. None of those organizations have reviewed, blessed, or sanctioned it.
+> **Unofficial, unsupported, proof-of-concept.** This project is an independent experiment and is **not affiliated with, endorsed by, or supported by Microsoft, GitHub, Anthropic, or OpenAI**. None of those organizations have reviewed, blessed, or sanctioned it.
 >
 > It is **not a product**. There is no warranty, no SLA, no support, and no guarantee of fitness for any purpose. APIs, headers, model availability, and tenant behavior on the upstream services can change at any time and break this proxy without notice.
 >
@@ -42,7 +44,34 @@
 
 ---
 
-A small Python reverse proxy that runs in Docker. It accepts Anthropic Messages API requests from Claude Code under `/claude/v1` and forwards them to Copilot's native `/v1/messages` endpoint. It accepts OpenAI Responses API requests from Codex CLI under `/codex/v1` and forwards them to Copilot's native `/responses` endpoint. **No protocol translation** - Copilot speaks both protocols natively for the model families this proxy exposes.
+A small Python reverse proxy that runs in Docker. Claude Code uses the Anthropic
+Messages routes under `/claude/v1`. Codex CLI and local Codex chats in the ChatGPT
+desktop app share the OpenAI Responses routes under `/codex/v1`. Both are
+forwarded to GitHub Copilot's native endpoints, with compatibility rewrites but
+**no conversion between Messages, Chat Completions, and Responses**.
+
+## Supported clients and scope
+
+| Client or surface | Relay integration | Setup |
+|---|---|---|
+| Claude Code | Native Anthropic Messages | [Claude setup](#claude-setup) |
+| Codex CLI | Native OpenAI Responses | [CLI setup](#codex-cli-setup) |
+| ChatGPT desktop app (Codex mode) | Runs local Codex chats through GitHub Copilot. Tested on Windows. | [App setup](#chatgpt-desktop-app-setup-codex-on-windows) and [validation details](docs/codex-desktop.md#recorded-validation) |
+| ChatGPT Chat, Work, voice, and other app services | Not configured or proxied by this integration | Separate app features, endpoints, and permissions |
+| Codex cloud tasks | Not supported by this loopback deployment | Cloud execution cannot use this computer's `127.0.0.1` relay |
+
+OpenAI's [current app documentation](https://learn.chatgpt.com/docs/app) describes
+a unified ChatGPT desktop app containing Codex. This repo retains
+`codex-desktop.ps1`, `docs/codex-desktop.md`, and existing provider IDs for
+compatibility. "Codex Desktop" in older records means that Codex experience, not
+support for all ChatGPT traffic. Worktree mode also runs locally, but has not
+been separately qualified here. See the [glossary](GLOSSARY.md) for terminology
+and [architecture](ARCHITECTURE.md) for implementation boundaries.
+
+The [project review](docs/project-review-2026-10-18.md) records four inherited
+runtime findings and their authorized fixes: truncation-safe diagnostics,
+synthetic-summary validation, catalog-shape checks, and authoritative Claude
+headers. Deployment of source changes still requires a relay restart.
 
 ## How it works
 
@@ -57,7 +86,8 @@ A small Python reverse proxy that runs in Docker. It accepts Anthropic Messages 
                                        | shared httpx AsyncClient, HTTP/2       |
                                        | proxy_shared streaming + passthrough   |
 +==============================+       |                                        |       +================================+
-| Codex CLI                    |       | Codex route handlers                   |       | GitHub Copilot                 |
+| Codex CLI / ChatGPT app      |       | Codex route handlers                   |       | GitHub Copilot                 |
+| (Codex, local)               |       |                                        |       |                                |
 | OpenAI Responses JSON/SSE    |       | build_codex_outbound_headers           |       | Responses native endpoints     |
 | POST /codex/v1/responses     | ====> | compact fallback, body cleanup         | ====> | POST /responses                |
 | POST /codex/v1/responses/    | ====> |                                        | ====> | POST /responses/compact        |
@@ -73,16 +103,21 @@ A small Python reverse proxy that runs in Docker. It accepts Anthropic Messages 
 | Client | Local relay routes | Upstream Copilot routes | Protocol |
 |---|---|---|---|
 | Claude Code | `POST /claude/v1/messages`<br>`GET /claude/v1/models` | `POST /v1/messages`<br>`GET /models` | Anthropic Messages JSON/SSE |
-| Codex CLI | `POST /codex/v1/responses`<br>`POST /codex/v1/responses/compact`<br>`GET /codex/v1/models` | `POST /responses`<br>tries `POST /responses/compact`, then falls back to `POST /responses`<br>`GET /models` | OpenAI Responses JSON/SSE |
+| Codex CLI and ChatGPT app (local Codex) | `POST /codex/v1/responses`<br>`POST /codex/v1/responses/compact`<br>`GET /codex/v1/models` | `POST /responses`<br>tries `POST /responses/compact`, with a synthetic fallback on 404<br>`GET /models` | OpenAI Responses JSON/SSE |
 
 | Relay step | What happens |
 |---|---|
-| Auth | Reads `COPILOT_GITHUB_TOKEN` from `.env`, originally extracted from Windows Credential Manager. |
+| Auth | Reads `COPILOT_GITHUB_TOKEN` from the container environment. Compose loads it from `.env` when creating the container. |
 | Header safety | Strips local client auth, cookies, host, content length, and hop-by-hop headers. |
 | Protocol headers | Adds the Copilot bearer plus Claude-specific or Codex-specific headers. |
 | Compatibility | Applies small route-specific body rewrites, then streams the native upstream response format back unchanged. |
 
-The proxy keeps each client on its native protocol. Claude Code sends Anthropic Messages traffic to `/claude/v1/messages`; Codex CLI sends OpenAI Responses traffic to `/codex/v1/responses`. The proxy swaps local dummy auth for the GitHub OAuth bearer Copilot expects, adds the Copilot headers each route needs, and leaves response streaming in the original SSE format.
+The proxy keeps each client on its native protocol. Codex's CLI and app clients
+share `/codex/v1/responses`; there is no extra desktop route or app patch. The
+proxy replaces local dummy auth with the GitHub OAuth bearer, adds Copilot
+headers, and forwards SSE incrementally. Keepalives are inserted only between
+complete events. The compaction fallback is an ordinary summary, not a verified
+v2/checkpoint implementation; see the [app limitations](docs/codex-desktop.md#limits).
 
 Four things make this work cleanly:
 
@@ -91,23 +126,31 @@ Four things make this work cleanly:
 3. Copilot exposes a native OpenAI Responses endpoint at `/responses` for GPT/Codex models — **no Chat Completions translation needed**.
 4. Setting `Copilot-Integration-Id: copilot-developer-cli` is what unlocks Claude and GPT-5 Responses models on this Copilot tenant (`vscode-chat` rejected `gpt-5.5` during live testing).
 
-## Claude Setup
+## Start the shared relay
 
-Requires: Docker Desktop, PowerShell 7+ (`pwsh`), and a working `copilot` CLI login (`copilot` then sign in).
+Use an existing Docker Desktop installation, PowerShell 7+ (`pwsh`), and a
+working `copilot` CLI login. Start one relay for all clients. App-only use does
+not require a separate Codex CLI installation; the tested app bundles its engine.
 
 ```powershell
-# 1. Extract your Copilot OAuth token from Credential Manager to .env
+# First-time setup: extract the Copilot OAuth token to the ignored .env file
 pwsh scripts\extract-token.ps1
 
-# 2. Start the proxy
-docker compose up --build
+# Start the shared relay
+docker compose up -d --build proxy
 
-# 3. In another terminal: verify Claude routes
-curl http://127.0.0.1:4141/claude/healthz
-curl http://127.0.0.1:4141/claude/v1/models
+# Read-only health checks, bypassing any shell proxy configuration
+Invoke-RestMethod http://127.0.0.1:4141/claude/healthz -NoProxy
+Invoke-RestMethod http://127.0.0.1:4141/codex/healthz -NoProxy
 ```
 
-Then point Claude Code at the proxy:
+Check `upstream_ok`, `upstream_status`, and the relevant model count, not just
+HTTP 200 or Docker's `healthy` label. These checks do not exercise inference.
+If the relay is already configured and healthy, skip token extraction and startup.
+
+## Claude Setup
+
+Start the shared relay above, then point your installed Claude Code at it:
 
 ```powershell
 # Print the Claude Code settings snippet
@@ -134,21 +177,13 @@ The helper writes the same settings as this manual `~/.claude/settings.json` exa
 
 Then restart Claude Code and run `claude` as usual. If Claude Code logs show `POST /v1/messages` instead of `POST /claude/v1/messages`, the base URL is missing the `/claude` suffix; rerun `pwsh scripts\claude-config.ps1 -Write`.
 
-## Codex Setup
+<a id="codex-setup"></a>
 
-Requires: Docker Desktop, PowerShell 7+ (`pwsh`), a working `copilot` CLI login, and Codex CLI.
+## Codex CLI setup
 
-```powershell
-# 1. Extract your Copilot OAuth token from Credential Manager to .env
-pwsh scripts\extract-token.ps1
-
-# 2. Start the proxy if it is not already running
-docker compose up --build
-
-# 3. In another terminal: verify Codex routes
-curl http://127.0.0.1:4141/codex/healthz
-curl http://127.0.0.1:4141/codex/v1/models
-```
+Start the shared relay above and use your installed Codex CLI. For Codex inside
+the ChatGPT app, use the [separate app setup](#chatgpt-desktop-app-setup-codex-on-windows)
+instead of the CLI writer.
 
 Codex uses its own path prefix so Claude Code's `/claude/v1/models` response stays Anthropic-shaped while Codex gets OpenAI Responses-compatible routes:
 
@@ -160,7 +195,13 @@ pwsh scripts\codex-config.ps1
 pwsh scripts\codex-config.ps1 -Write
 ```
 
-The helper configures two files. The provider lives in `~/.codex/config.toml`:
+With `-Write` and confirmation, the helper refreshes the managed provider,
+**replaces the whole `copilot.config.toml` profile**, removes legacy profile
+tables, and cleans up its obsolete `CODEX_PROXY_API_KEY` user-environment and
+PowerShell-profile setup. Use print-only mode and merge manually if you have
+customized those sections. It is not an app-configuration repair tool.
+
+The provider lives in `~/.codex/config.toml`:
 
 ```toml
 [model_providers.copilot]
@@ -194,7 +235,12 @@ Then start Codex with the relay profile. The proxy strips the dummy client auth 
 codex -p copilot
 ```
 
-The command-auth block emits a non-secret local dummy token. Codex 0.143+ only refreshes `/models` for custom providers with command auth; an `env_key` provider falls back to Codex's bundled picker and hides Copilot models such as GPT-5.6. The relay discards the dummy token and injects your Copilot OAuth bearer upstream. The proxy also strips Codex's unsupported `image_generation` tool and `previous_response_id` before forwarding. `web_search` is preserved because this tenant's Copilot `/responses` endpoint accepts it.
+Command auth is the tested relay configuration for custom-provider discovery.
+It avoids relying on an older `env_key` setup that fell back to the bundled
+picker in prior testing. The command emits only a non-secret dummy token; the
+relay discards it and injects the Copilot OAuth bearer upstream. The proxy strips
+unsupported `image_generation` tools and `previous_response_id`, but preserves
+`web_search`. Upstream feature support still depends on the selected model.
 
 Useful Codex checks:
 
@@ -207,6 +253,41 @@ codex exec --skip-git-repo-check --ephemeral --sandbox read-only -p copilot "Rep
 ```
 
 `/codex/v1/models` returns both OpenAI's model-list shape (`object`, `data`) and Codex's model catalog shape (`models`) because current Codex CLI tooling uses the richer catalog for discovery.
+
+<a id="codex-desktop-setup-windows"></a>
+
+## ChatGPT desktop app setup (Codex on Windows)
+
+Start the shared relay, then use **Codex** in the unified ChatGPT desktop app.
+Choose a local chat on **This computer**, not ChatGPT Chat/Work or a cloud task.
+The app's bundled Codex engine uses the same `/codex/v1` Responses routes as the
+CLI, without an app patch, TLS interception, or a second proxy.
+
+```powershell
+# Check the relay, both catalog shapes, selected model, and tested app package
+# Read-only prerequisites only: no inference, configuration writes, or installs
+pwsh scripts\codex-desktop.ps1 -Check -Model gpt-6-astra
+
+# Print the configuration to review and merge; nothing is applied automatically
+pwsh scripts\codex-desktop.ps1 -Model gpt-6-astra
+```
+
+The example model must be present in your relay catalog. The helper uses the
+separate `copilot_desktop` provider, an explicit catalog URL, command-backed
+dummy auth, and HTTP/SSE rather than WebSockets. It recognizes the tested
+Windows package ID `OpenAI.Codex`; that identifier is not renamed to match the UI.
+
+Follow the [app guide](docs/codex-desktop.md) to merge root settings and provider
+tables into `%USERPROFILE%\.codex\config.toml`, preserve existing configuration,
+restart the app after saving drafts, and verify the actual provider and tool loop.
+Changing shared root defaults also affects CLI launches without an explicit
+profile. Neither helper mode changes credentials, permissions, or environment.
+**Full access is not required to route through the relay.**
+
+The Windows pilot includes a GUI tool round trip, updated-relay bundled-engine
+tests, and a user-confirmed response after the live relay restart. GUI follow-up,
+cancellation/recovery, and reopening remain unverified. A passing `-Check` is
+not proof of those workflows or of inference.
 
 ## Lifecycle helper
 
@@ -230,6 +311,19 @@ copilot-cli-relay - pick an action:
 ```
 
 For scripted use, prefer the underlying `docker compose` commands directly.
+The `codex` menu action checks the shared CLI/app route, not the app's effective
+configuration or inference.
+
+| Changed input | Apply it with |
+|---|---|
+| Bind-mounted `src/` code | `docker compose restart proxy` |
+| `.env` token or relay settings | `docker compose up -d --force-recreate proxy` |
+| Dependencies or Dockerfile | Rebuild the image, then recreate the container |
+| App provider configuration | Save your work and fully restart the ChatGPT app |
+
+Container restart does not reload Compose's `env_file`; see
+[Docker's restart reference](https://docs.docker.com/reference/cli/docker/compose/restart/).
+Wait for active requests to finish before restarting or recreating the relay.
 
 ## Claude Model Selection
 
@@ -302,7 +396,7 @@ Optional env vars to consider adding to the `"env"` block:
     <tr>
       <td width="310"><code>COPILOT_CODEX_INTEGRATION_ID</code></td>
       <td>value of <code>COPILOT_INTEGRATION_ID</code>, normally <code>copilot-developer-cli</code></td>
-      <td>Sent only on Codex <code>/codex/v1/responses</code> and <code>/codex/v1/models</code>. Live testing on this tenant showed <code>copilot-developer-cli</code> exposes GPT-5 Responses models.</td>
+      <td>Sent on Codex Responses, compaction, and model-discovery requests for both CLI and app clients. Uses the tested Copilot integration identity.</td>
     </tr>
     <tr>
       <td width="310"><code>COPILOT_CODEX_EDITOR_VERSION</code></td>
@@ -350,17 +444,19 @@ Optional env vars to consider adding to the `"env"` block:
 ## Troubleshooting
 
 - **`/claude/v1/models` returns no Claude models:** your `COPILOT_INTEGRATION_ID` is wrong, or your org policy doesn't include Claude models for your account.
-- **401 from upstream:** your token rotated. Re-run `pwsh scripts\extract-token.ps1` and `docker compose restart proxy`.
+- **401 from upstream:** the Copilot token may have expired or rotated. Refresh it with `pwsh scripts\extract-token.ps1`, then recreate the container with `docker compose up -d --force-recreate proxy` so Compose reloads `.env`. If it persists, check account access rather than changing app credentials.
 - **`COPILOT_GITHUB_TOKEN is required`:** run `extract-token.ps1` first; it writes `.env`.
 - **Source edits not picked up:** the container runs uvicorn without `--reload`. Run `docker compose restart proxy` after editing `src/`. (Bind-mount file events on Windows are also flaky, so the restart is the reliable path.)
 - **`Unable to connect to API (ConnectionRefused)` in Claude Code:** the container isn't running. `docker compose up -d proxy` brings it back. The compose file uses `restart: unless-stopped`, so this should only happen after a clean `docker compose down`.
 - **Claude Code posts to `/v1/messages` and gets 404:** your Claude base URL is missing the namespace. Run `pwsh scripts\claude-config.ps1 -Write`, restart Claude Code, and confirm `ANTHROPIC_BASE_URL` is `http://127.0.0.1:4141/claude`.
 - **Codex says stream disconnected before completion:** confirm the proxy is running and Codex is pointed at `http://127.0.0.1:4141/codex/v1`, not the Claude base URL `http://127.0.0.1:4141/claude`.
-- **Codex `/model` only shows bundled models such as GPT-5.5:** run `pwsh scripts\codex-config.ps1 -Write` to replace the old `env_key` provider with command auth, then restart Codex.
-- **Codex 401 or missing auth:** re-run `pwsh scripts\codex-config.ps1 -Write` and confirm `[model_providers.copilot.auth]` is present in `~/.codex/config.toml`.
+- **Codex CLI `/model` only shows bundled models:** compare the printed CLI provider with your selected profile and command-auth setup. `codex-config.ps1 -Write` manages and replaces the sections described above; do not run it blindly over a customized profile or use it to repair the app.
+- **Codex CLI missing auth:** confirm the selected provider has the matching `[model_providers.<id>.auth]` table. Distinguish local auth-helper failures from an upstream Copilot 401.
 - **Codex errors with `--profile copilot cannot be used while ... contains legacy profile = "copilot" or [profiles.copilot] config`:** Codex 0.134+ moved profiles into their own file. Re-run `pwsh scripts\codex-config.ps1 -Write` (it removes the legacy `[profiles.copilot*]` tables from `config.toml` and writes the profile to `~/.codex/copilot.config.toml`). To migrate by hand, move the keys under `[profiles.copilot]` into `~/.codex/copilot.config.toml` as top-level keys (drop the `profiles.copilot` prefix) and delete the legacy tables.
-- **Codex model not supported:** run `curl http://127.0.0.1:4141/codex/v1/models` and pick a model listed there. The current default is `gpt-5.6-sol` when your Copilot tenant exposes it.
+- **Codex model not supported:** query `/codex/v1/models` and select a model present in both catalogs. The CLI helper defaults to `gpt-5.6-sol`; the app helper defaults to the pilot's `gpt-6-astra`. Neither default guarantees account access.
 - **Codex model discovery:** `/codex/v1/models` includes both OpenAI-compatible `data` and Codex-compatible `models` fields.
+- **ChatGPT app ignores the relay:** select Codex and a local chat, inspect configuration precedence and any `model_catalog_json` override, then follow the [app troubleshooting guide](docs/codex-desktop.md#troubleshooting). Do not change ChatGPT Chat/Work settings or relax app permissions to force a connection.
+- **Docker says healthy but Codex fails:** the Compose healthcheck only checks the Claude health endpoint's HTTP status. Run `codex-desktop.ps1 -Check` for app prerequisites, then verify an actual local Codex request.
 
 ### When a new or changed model breaks Claude
 
@@ -389,7 +485,7 @@ Upstream model availability and request schemas change without notice. Reasoning
 
 ## Development
 
-**Everything happens in Docker.** Python is not required on the host — there's no host-side `venv`, no host-side `uv`, no host-side `pip install`. The Docker image is the *only* environment the project runs in, including for tests and for managing dependencies. This keeps dev, test, and prod identical and means `git clone` + Docker Desktop is the entire prerequisite list.
+**The Python relay and its tests run in Docker.** There is no host-side Python environment or package workflow. Windows client-configuration helpers use the already-installed PowerShell 7; their tests require no extra modules.
 
 ```powershell
 # Run the proxy (Docker)
@@ -423,11 +519,21 @@ docker compose exec proxy bash
 # Codex route smoke checks
 curl http://127.0.0.1:4141/codex/healthz
 curl http://127.0.0.1:4141/codex/v1/models
+
+# ChatGPT app / Codex helper tests (existing host PowerShell, no network or installs)
+pwsh tests\powershell\test-codex-desktop.ps1
 ```
+
+The verified baseline is 478 Python tests, 99% package coverage, and 38
+PowerShell assertions. PowerShell assertions are separate from the Python test
+badge. Automated transport tests do not replace the version-scoped
+[app qualification](docs/codex-desktop.md#recorded-validation).
 
 ### Adding or upgrading a dependency
 
-The lockfile (`uv.lock`) is committed and the Dockerfile uses `uv sync --frozen`, so any change to `pyproject.toml` requires a matching `uv lock` regeneration before the next build will succeed. Both steps run in throwaway containers — nothing leaks onto the host.
+The lockfile (`uv.lock`) is committed and the Dockerfile uses `uv sync --frozen`.
+Regenerate the lockfile when changing dependency requirements in `pyproject.toml`.
+Resolve and validate dependencies in disposable containers, not on the host.
 
 ```powershell
 # 1. Edit pyproject.toml (add/remove/bump a package).
@@ -446,15 +552,18 @@ If you don't yet have the `copilot-cli-relay:dev` image locally, replace step 2 
 
 ## Security notes
 
-- The OAuth token is read fresh from `.env` at container start; the proxy never persists it.
+- Compose loads the OAuth token from `.env` when creating the container; the proxy reads its environment at process startup and never persists the token. Recreate the container after changing `.env`.
 - `extract-token.ps1` writes `.env` with a hardened ACL: inheritance is disabled and dropped, then explicit ACEs are added for the current user and `NT AUTHORITY\SYSTEM`. In practice the resulting on-disk DACL also includes `BUILTIN\Administrators` with FullControl when the script is run by an account in that group; the script does not strip this. It refuses to write the token if the ACL hardening fails. On a single-user dev box this is "owner-only" in practice; on a host with multiple local Administrators, anyone in that group can read the file.
 - The proxy binds only to `127.0.0.1:4141` on the host. Not reachable from the network.
 - The app also rejects non-loopback `Host` headers, browser cross-site `Origin` / `Sec-Fetch-Site` requests, and non-JSON POSTs to proxy endpoints. This blocks DNS-rebinding and simple-form browser requests before the relay injects the Copilot token.
 - The container runs as a non-root user (UID 1000).
 - Inbound `Authorization`, `x-api-key`, `proxy-authorization`, `Cookie`, and `User-Agent` headers from clients are stripped before any upstream forward (regression-tested). Upstream `Set-Cookie` is stripped from responses returned to the client.
 - Codex-specific local headers such as `x-codex-turn-metadata`, `session_id`, and `thread_id` are not forwarded to Copilot; the proxy rebuilds the Responses headers from its own settings.
+- The app's local tools run in the Codex execution environment, not inside this relay container. Prompts, source excerpts, tool arguments, and tool results included in model requests still reach GitHub Copilot. A model route does not authorize local tools, MCP servers, plugins, or other app connections.
+- The dummy client token is not an access-control boundary. This is a single-user loopback relay, not an authenticated multi-user gateway. Do not expose its port to the network or disable its browser guards.
 - Body logging is **off by default**. When enabled, secrets are redacted: GitHub tokens (classic `gh[ousrp]_` and fine-grained `github_pat_`), JWTs, `sk-`/`sk-ant-`/`sk-proj-` keys, AWS access key ids, AWS secret access keys when prefixed by their conventional key name, Slack tokens (`xox[baprs]-`), Stripe live/restricted keys (`sk_live_/rk_live_`), Google API keys (`AIza…`), generic `Bearer …` tokens, the values of `Authorization` / `x-api-key` / `api-key` / `proxy-authorization` header lines (both raw `Header: value` form and quoted dict-/JSON-repr form), and JSON keys named `password` / `api_key` / `access_token` / `auth_token` / `secret` / `client_secret` / `refresh_token` / `private_key`. Exception messages on every error path also go through the same redaction before being logged or returned to the client. **Bodies still contain the user's source code** — redaction is best-effort, not a substitute for treating logs as sensitive.
 - `.env` and `.env.*` are gitignored and dockerignored (with `!.env.example` exception). Verify with `git check-ignore -v .env` before your first commit.
+- Diagnostic bodies reaching their raw input limit are omitted before redaction or shortening: 16 KiB for body logging, 32 KiB for bounded upstream errors. Redaction failures also return a static omission marker. In-limit bodies are sanitized before display truncation. Pattern-based redaction still does not make arbitrary diagnostics safe to share; see the [fix and remaining limits](docs/project-review-2026-10-18.md#1-truncation-can-defeat-field-based-secret-redaction).
 
 ## License
 

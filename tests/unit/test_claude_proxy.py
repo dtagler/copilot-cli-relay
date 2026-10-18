@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import aclosing
 
 import httpx
 import pytest
@@ -888,10 +889,11 @@ async def test_chunks_with_keepalive_emits_ping(monkeypatch):
             return False
 
     out = []
-    async for chunk, sentinel in proxy_shared_mod.chunks_with_keepalive(FakeUpstream(), FakeRequest()):
-        out.append((chunk, sentinel))
-        if len(out) >= 5:
-            break
+    async with aclosing(proxy_shared_mod.chunks_with_keepalive(FakeUpstream(), FakeRequest())) as chunks:
+        async for chunk, sentinel in chunks:
+            out.append((chunk, sentinel))
+            if len(out) >= 5:
+                break
     # First yielded item must be a ping sentinel (upstream is silent past PING_INTERVAL_SECS).
     assert out[0] == (b"", "ping")
 
@@ -1458,8 +1460,8 @@ def test_models_upstream_200_json_array_payload():
     """Defensive: upstream returns a JSON array (not the expected dict)."""
     client, _ = _make_client(lambda req: httpx.Response(200, json=["unexpected", "shape"]))
     r = client.get("/claude/v1/models")
-    assert r.status_code == 200
-    assert r.json()["data"] == []
+    assert r.status_code == 502
+    assert r.json()["error"]["type"] == "api_error"
 
 
 def test_models_upstream_error_body_redacted():
@@ -1523,6 +1525,7 @@ def test_healthz_upstream_token_expired_hint():
     assert body["upstream_ok"] is False
     assert body["upstream_status"] == 401
     assert "extract-token.ps1" in body["hint"]
+    assert "docker compose up -d --force-recreate proxy" in body["hint"]
 
 
 def test_healthz_upstream_200_non_json_body_is_not_ok():

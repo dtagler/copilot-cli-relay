@@ -1,4 +1,4 @@
-"""Run with `python -m copilot_cli_relay` for local (host) debugging.
+"""Optional `python -m copilot_cli_relay` entrypoint for debugging inside Docker.
 
 Defaults to binding 127.0.0.1 — the same loopback-only stance the docker-compose
 service enforces. To listen on a different interface, set `COPILOT_PROXY_HOST`

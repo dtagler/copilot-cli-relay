@@ -1,3 +1,3 @@
-"""copilot-cli-relay: Claude Code and Codex CLI reverse proxy backed by GitHub Copilot."""
+"""GitHub Copilot relay for Claude Code, Codex CLI, and Codex in the ChatGPT desktop app."""
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"

@@ -21,7 +21,7 @@ from copilot_cli_relay.security import _host_without_port, _is_json_content_type
 
 
 def test_version_string():
-    assert __version__ == "0.4.1"
+    assert __version__ == "0.5.0"
 
 
 # ---------- errors.py ----------

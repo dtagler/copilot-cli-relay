@@ -5,6 +5,8 @@
 .DESCRIPTION
   Run with no arguments. Pick an action from the numbered list and the script
   performs it then exits. Includes explicit Claude and Codex route checks.
+  The Codex route is shared by the CLI and local Codex in the ChatGPT app;
+  these checks do not verify the app's active configuration or inference.
   For scripted/CI use, prefer plain `docker compose`.
 #>
 #requires -Version 7
@@ -46,7 +48,7 @@ function Test-RelayNamespace {
     $health = Invoke-RestMethod -Uri $HealthUrl -TimeoutSec 5
     $health | ConvertTo-Json -Compress
     if (-not $health.upstream_ok) {
-      Write-Host "WARNING: $Name upstream_ok=false. Token may be stale; run 'pwsh scripts\extract-token.ps1' then restart." -ForegroundColor Yellow
+      Write-Host "WARNING: $Name upstream_ok=false. Token may be stale; run 'pwsh scripts\extract-token.ps1' then 'docker compose up -d --force-recreate proxy' to reload .env." -ForegroundColor Yellow
       exit 1
     }
   } catch {

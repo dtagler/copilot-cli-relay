@@ -4,11 +4,12 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from contextlib import aclosing
 from typing import Any
 
 import httpx
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import JSONResponse, Response
 
 from .config import get_settings
 from .errors import anthropic_json_error, anthropic_sse_error_event
@@ -18,6 +19,7 @@ from .model_capabilities import EffortCaps
 from .proxy_shared import (
     MAX_UPSTREAM_ERROR_BYTES,
     UPSTREAM_TIMEOUT,
+    UpstreamStreamingResponse,
     chunks_with_keepalive,
     filter_response_headers,
     passthrough_response,
@@ -382,8 +384,7 @@ def _build_non_streaming_error(
     via a giant error body and (b) reflect injected request headers — the
     proxy's own Bearer token included — verbatim into the local client.
     """
-    err_text = err_bytes.decode("utf-8", "replace")
-    redacted = redact_text(err_text)
+    redacted = redact_bytes(err_bytes, max_bytes=MAX_UPSTREAM_ERROR_BYTES).decode("utf-8", "replace")
     settings = get_settings()
     if settings.log_bodies:
         logger.warning(
@@ -471,9 +472,8 @@ async def _stream_response(
                 err_bytes = b""
         finally:
             await upstream.aclose()
-        err_text = err_bytes.decode("utf-8", "replace")
         settings = get_settings()
-        redacted = redact_text(err_text)
+        redacted = redact_bytes(err_bytes, max_bytes=MAX_UPSTREAM_ERROR_BYTES).decode("utf-8", "replace")
         if settings.log_bodies:
             logger.warning(
                 "upstream %d on stream request_id=%s body=%s",
@@ -504,13 +504,14 @@ async def _stream_response(
 
     async def body_iter():
         try:
-            async for chunk, sentinel in chunks_with_keepalive(upstream, request):
-                if sentinel == "disconnect":
-                    return
-                if sentinel == "ping":
-                    yield b"event: ping\ndata: {\"type\":\"ping\"}\n\n"
-                    continue
-                yield chunk
+            async with aclosing(chunks_with_keepalive(upstream, request)) as chunks:
+                async for chunk, sentinel in chunks:
+                    if sentinel == "disconnect":
+                        return
+                    if sentinel == "ping":
+                        yield b"event: ping\ndata: {\"type\":\"ping\"}\n\n"
+                        continue
+                    yield chunk
         except Exception as exc:
             # Catch broadly: the producer in chunks_with_keepalive captures
             # any non-cancellation Exception (OSError, ssl.SSLError,
@@ -536,9 +537,9 @@ async def _stream_response(
     response_headers["Cache-Control"] = "no-cache"
     response_headers["X-Accel-Buffering"] = "no"
 
-    return StreamingResponse(
+    return UpstreamStreamingResponse(
         body_iter(),
-        media_type="text/event-stream",
+        upstream=upstream,
         headers=response_headers,
     )
 
@@ -570,7 +571,11 @@ async def proxy_claude_models(request: Request) -> Response:
             "api_error",
             f"Upstream /models returned non-JSON body: {redact_text(resp.text)[:200]}",
         )
-    raw = payload.get("data", []) if isinstance(payload, dict) else []
+    raw = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return anthropic_json_error(
+            "api_error", "Upstream /models returned an invalid model catalog; expected a data array.", status=502,
+        )
     items: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for m in raw:
@@ -621,7 +626,8 @@ async def proxy_claude_models(request: Request) -> Response:
 
 
 def _is_anthropic(model: object) -> bool:
-    return isinstance(model, dict) and (model.get("vendor") or "").lower() == "anthropic"
+    vendor = model.get("vendor") if isinstance(model, dict) else None
+    return isinstance(vendor, str) and vendor.lower() == "anthropic"
 
 
 async def claude_healthz(request: Request) -> Response:
@@ -649,11 +655,13 @@ async def claude_healthz(request: Request) -> Response:
             except ValueError as exc:
                 logger.warning("claude_healthz upstream 200 with non-JSON body: %s", exc)
             else:
-                upstream_ok = True
-                data = payload.get("data", []) if isinstance(payload, dict) else []
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if not isinstance(data, list):
+                    raise ValueError("Upstream /models returned an invalid model catalog; expected a data array.")
                 model_count = sum(1 for m in data if _is_anthropic(m))
+                upstream_ok = True
         elif resp.status_code in (401, 403):
-            hint = "token may be expired; re-run scripts/extract-token.ps1 then docker compose restart proxy"
+            hint = "token may be expired; re-run scripts/extract-token.ps1 then docker compose up -d --force-recreate proxy"
     except Exception as exc:
         logger.warning("claude_healthz upstream check failed: %s", redact_text(str(exc)))
     body = {

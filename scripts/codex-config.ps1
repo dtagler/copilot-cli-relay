@@ -9,8 +9,10 @@
   (Codex 0.134+ overlays `--profile copilot` from that separate file and no
   longer reads a legacy [profiles.copilot] table from config.toml). It also
   removes any legacy [profiles.copilot*] tables / `profile = "copilot"` selector
-  from config.toml. The provider uses a non-secret command token so Codex 0.143+
-  refreshes its model picker from the relay. All file changes require an explicit YES.
+  from config.toml. Command-backed dummy auth is the tested relay discovery setup.
+  All file changes require an explicit YES.
+  For Codex in the ChatGPT desktop app, use codex-desktop.ps1 instead; this writer
+  replaces the CLI profile and cleans up its legacy user-environment setup.
 #>
 #requires -Version 7
 [CmdletBinding()]

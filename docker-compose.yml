@@ -12,11 +12,12 @@ services:
       # so the Docker publish can reach it; the host-side bind keeps it off the network.
       - "127.0.0.1:4141:4141"
     healthcheck:
-      # Liveness + upstream reachability. Uses python (already in the image)
-      # so we don't have to add curl/wget. Restart-on-stuck behavior is
-      # handled by `restart: unless-stopped` below — Compose itself doesn't
-      # restart unhealthy containers, but the healthcheck makes the state
-      # visible in `docker compose ps` and to any external orchestrator.
+      # HTTP liveness only: /claude/healthz also probes upstream, but returns
+      # HTTP 200 even when upstream_ok=false. Inspect the JSON or use the
+      # route helpers for upstream/model readiness; this is not an inference test.
+      # Python is already in the image, so no curl/wget installation is needed.
+      # Compose does not restart unhealthy/stuck containers automatically;
+      # restart: unless-stopped applies when the container exits.
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4141/claude/healthz', timeout=3).status==200 else 1)"]
       interval: 30s
       timeout: 5s

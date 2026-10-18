@@ -78,17 +78,27 @@ def redact_text(text: str) -> str:
     return text
 
 
-def redact_bytes(body: bytes) -> bytes:
-    body = _DATA_URI_RE.sub(
-        lambda m: m.group(0)[:64] + b"...[truncated " + str(len(m.group(2))).encode() + b" b64 chars]",
-        body,
-    )
-    if len(body) > MAX_BODY_BYTES:
-        body = body[:MAX_BODY_BYTES] + b"...[truncated]"
+def redact_bytes(body: bytes, *, max_bytes: int = MAX_BODY_BYTES) -> bytes:
+    """Redact complete, bounded diagnostic input; omit potentially cut bodies.
+
+    An exact-cap input may already have been truncated by a bounded reader.
+    Check its raw size before shrinking fields or data URIs, and never try to
+    reconstruct a secret whose delimiter may be outside the available input.
+    """
+    if len(body) >= max_bytes:
+        return b"[body omitted at diagnostic size limit]...[truncated]"
     try:
-        return redact_text(body.decode("utf-8", errors="replace")).encode("utf-8")
-    except Exception:
+        body = redact_text(body.decode("utf-8", errors="replace")).encode("utf-8")
+        body = _DATA_URI_RE.sub(
+            lambda m: m.group(0)[:64] + b"...[truncated " + str(len(m.group(2))).encode() + b" b64 chars]",
+            body,
+        )
+        # Redaction can expand short values. Only truncate after sanitizing.
+        if len(body) > max_bytes:
+            body = body[:max_bytes] + b"...[truncated]"
         return body
+    except Exception:
+        return b"[body omitted: redaction failed]"
 
 
 logger = logging.getLogger("copilot_cli_relay")

@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 320" role="img" aria-label="copilot-cli-relay">
   <title>copilot-cli-relay</title>
+  <desc>GitHub Copilot relay for Claude Code, Codex CLI, and Codex in the ChatGPT desktop app.</desc>
   <defs>
     <linearGradient id="wordmark" gradientUnits="userSpaceOnUse" x1="220" y1="0" x2="1580" y2="0">
       <stop offset="0%" stop-color="#79C0FF"/>
@@ -45,5 +46,5 @@
         font-weight="600"
         letter-spacing="4"
         text-anchor="middle"
-        fill="#8B949E">CLAUDE CODE + CODEX CLI - GITHUB COPILOT</text>
+        fill="#8B949E">CLAUDE CODE + CODEX CLI + CODEX IN CHATGPT</text>
 </svg>

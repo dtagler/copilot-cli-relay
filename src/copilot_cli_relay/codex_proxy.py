@@ -1,14 +1,16 @@
-"""OpenAI Responses-compatible proxy routes for Codex CLI."""
+"""OpenAI Responses-compatible proxy routes for Codex CLI and Desktop."""
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
+from contextlib import aclosing
 from typing import Any
 
 import httpx
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import JSONResponse, Response
 
 from .config import get_settings
 from .errors import openai_json_error, openai_sse_error_event
@@ -17,6 +19,7 @@ from .logging_setup import logger, redact_bytes, redact_text
 from .proxy_shared import (
     MAX_UPSTREAM_ERROR_BYTES,
     UPSTREAM_TIMEOUT,
+    UpstreamStreamingResponse,
     chunks_with_keepalive,
     filter_response_headers,
     passthrough_response,
@@ -69,7 +72,9 @@ def _is_agent_call(parsed: dict[str, Any]) -> bool:
             continue
         if item.get("role") == "assistant":
             return True
-        if item.get("type") in {"function_call", "function_call_output"}:
+        if item.get("type") in {
+            "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
+        }:
             return True
     return False
 
@@ -113,7 +118,10 @@ def _rewrite_codex_body(parsed: dict[str, Any], *, request_id: str) -> bool:
                 parsed["tools"] = kept_tools
             else:
                 parsed.pop("tools", None)
-        if stripped_tools and _choice_targets_stripped_tool(parsed.get("tool_choice"), stripped_tools):
+        if stripped_tools and (
+            _choice_targets_stripped_tool(parsed.get("tool_choice"), stripped_tools)
+            or (not kept_tools and parsed.get("tool_choice") == "required")
+        ):
             parsed.pop("tool_choice", None)
             mutated = True
     return mutated
@@ -179,8 +187,7 @@ def _build_openai_upstream_error(
     request_id: str,
     route: str,
 ) -> Response:
-    err_text = err_bytes.decode("utf-8", "replace")
-    redacted = redact_text(err_text)
+    redacted = redact_bytes(err_bytes, max_bytes=MAX_UPSTREAM_ERROR_BYTES).decode("utf-8", "replace")
     settings = get_settings()
     if settings.log_bodies:
         logger.warning("upstream %d on %s request_id=%s body=%s", status, route, request_id, redacted[:500])
@@ -315,13 +322,14 @@ async def _codex_stream_response(
 
     async def body_iter():
         try:
-            async for chunk, sentinel in chunks_with_keepalive(upstream, request):
-                if sentinel == "disconnect":
-                    return
-                if sentinel == "ping":
-                    yield b": keepalive\n\n"
-                    continue
-                yield chunk
+            async with aclosing(chunks_with_keepalive(upstream, request)) as chunks:
+                async for chunk, sentinel in chunks:
+                    if sentinel == "disconnect":
+                        return
+                    if sentinel == "ping":
+                        yield b": keepalive\n\n"
+                        continue
+                    yield chunk
         except Exception as exc:
             safe = redact_text(str(exc))
             logger.warning("Codex stream error request_id=%s err=%s", request_id, safe)
@@ -335,7 +343,7 @@ async def _codex_stream_response(
     )
     response_headers["Cache-Control"] = "no-cache"
     response_headers["X-Accel-Buffering"] = "no"
-    return StreamingResponse(body_iter(), media_type="text/event-stream", headers=response_headers)
+    return UpstreamStreamingResponse(body_iter(), upstream=upstream, headers=response_headers)
 
 
 async def proxy_codex_responses(request: Request) -> Response:
@@ -409,6 +417,143 @@ def _compact_input_with_prompt(input_value: object) -> list[dict[str, Any]]:
     return input_items
 
 
+def _compact_nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _compact_text_parts(parts: object, kind: str) -> bool:
+    return isinstance(parts, list) and all(
+        isinstance(part, dict) and part.get("type") == kind and isinstance(part.get("text"), str)
+        for part in parts
+    )
+
+
+def _compact_usage_valid(usage: object) -> bool:
+    # Responses usage is optional/nullable. Preserve partial provider accounting
+    # objects, but validate every known count/detail that is actually supplied.
+    if usage is None:
+        return True
+    if not isinstance(usage, dict):
+        return False
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        if key in usage and not _compact_nonnegative_int(usage[key]):
+            return False
+    for key, counts in (
+        ("input_tokens_details", ("cached_tokens", "cache_write_tokens")),
+        ("output_tokens_details", ("reasoning_tokens",)),
+    ):
+        if key in usage:
+            detail = usage[key]
+            if not isinstance(detail, dict) or any(
+                name in detail and not _compact_nonnegative_int(detail[name]) for name in counts
+            ):
+                return False
+    return True
+
+
+def _compact_annotation_valid(annotation: object) -> bool:
+    if not isinstance(annotation, dict) or not isinstance(annotation.get("type"), str):
+        return False
+    fields = {
+        "file_citation": (("file_id", "filename"), ("index",)),
+        "file_path": (("file_id",), ("index",)),
+        "url_citation": (("url", "title"), ("start_index", "end_index")),
+        "container_file_citation": (("container_id", "file_id", "filename"), ("start_index", "end_index")),
+    }.get(annotation["type"])
+    if fields is None:
+        return False
+    strings, indexes = fields
+    return all(isinstance(annotation.get(key), str) for key in strings) and all(
+        _compact_nonnegative_int(annotation.get(key)) for key in indexes
+    )
+
+
+def _compact_logprob_valid(value: object, *, top_level: bool = True) -> bool:
+    if not isinstance(value, dict) or not isinstance(value.get("token"), str):
+        return False
+    probability = value.get("logprob")
+    if isinstance(probability, bool) or not (
+        isinstance(probability, int) or isinstance(probability, float) and math.isfinite(probability)
+    ):
+        return False
+    raw_bytes = value.get("bytes")
+    if raw_bytes is not None and (
+        not isinstance(raw_bytes, list)
+        or any(not _compact_nonnegative_int(byte) or byte > 255 for byte in raw_bytes)
+    ):
+        return False
+    if top_level:
+        alternatives = value.get("top_logprobs", [])
+        return isinstance(alternatives, list) and all(
+            _compact_logprob_valid(item, top_level=False) for item in alternatives
+        )
+    return True
+
+
+def _finite_json_number(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Non-finite JSON number.")
+    return number
+
+
+def _has_usable_compact_summary(result: object) -> bool:
+    """Accept completed assistant text, not failed or unfinished tool output."""
+    if (
+        not isinstance(result, dict)
+        or result.get("status") != "completed"
+        or result.get("error") is not None
+        or result.get("incomplete_details") is not None
+        or not _compact_usage_valid(result.get("usage"))
+    ):
+        return False
+    output = result.get("output")
+    if not isinstance(output, list):
+        return False
+    has_summary = False
+    for item in output:
+        if not isinstance(item, dict):
+            return False
+        if "id" in item and not isinstance(item["id"], str):
+            return False
+        if item.get("type") == "reasoning":
+            if (
+                item.get("status") not in (None, "completed")
+                or not _compact_text_parts(item.get("summary"), "summary_text")
+                or ("content" in item and not _compact_text_parts(item["content"], "reasoning_text"))
+                or (item.get("encrypted_content") is not None and not isinstance(item["encrypted_content"], str))
+            ):
+                return False
+            continue
+        if (
+            item.get("type") != "message"
+            or item.get("role") != "assistant"
+            or item.get("status") != "completed"
+            or item.get("phase") not in (None, "commentary", "final_answer")
+        ):
+            return False
+        content = item.get("content")
+        if not isinstance(content, list) or not content:
+            return False
+        for part in content:
+            if (
+                not isinstance(part, dict)
+                or part.get("type") != "output_text"
+                or not isinstance(part.get("text"), str)
+            ):
+                return False
+            annotations = part.get("annotations", [])
+            if not isinstance(annotations, list) or not all(_compact_annotation_valid(a) for a in annotations):
+                return False
+            logprobs = part.get("logprobs")
+            if logprobs is not None and (
+                not isinstance(logprobs, list) or not all(_compact_logprob_valid(value) for value in logprobs)
+            ):
+                return False
+            has_summary = has_summary or bool(part["text"].strip())
+    return has_summary
+
+
 async def _synthetic_compact(
     *,
     request: Request,
@@ -442,21 +587,28 @@ async def _synthetic_compact(
     )
     if upstream.status_code >= 400:
         return upstream
+    if not 200 <= upstream.status_code < 300:
+        return openai_json_error("server_error", "Synthetic compact upstream returned a non-success status.", status=502)
     try:
-        result = json.loads(upstream.body)
-    except ValueError:
+        result = json.loads(
+            upstream.body, parse_float=_finite_json_number, parse_constant=_finite_json_number,
+        )
+    except (ValueError, RecursionError):
         return openai_json_error("server_error", "Synthetic compact upstream returned non-JSON.", status=502)
-    return JSONResponse({
-        "id": f"resp_compact_{uuid.uuid4().hex[:24]}",
-        "object": "response.compaction",
-        "created_at": int(time.time()),
-        "output": result.get("output", []) if isinstance(result, dict) else [],
-        "usage": (
-            result.get("usage", {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
-            if isinstance(result, dict)
-            else {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        ),
-    })
+    if not _has_usable_compact_summary(result):
+        return openai_json_error(
+            "server_error", "Synthetic compact upstream did not return a completed, usable summary.", status=502,
+        )
+    try:
+        return JSONResponse({
+            "id": f"resp_compact_{uuid.uuid4().hex[:24]}",
+            "object": "response.compaction",
+            "created_at": int(time.time()),
+            "output": result["output"],
+            "usage": result.get("usage", {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+        })
+    except (TypeError, ValueError, RecursionError):
+        return openai_json_error("server_error", "Synthetic compact upstream returned unserializable data.", status=502)
 
 
 async def proxy_codex_responses_compact(request: Request) -> Response:
@@ -605,7 +757,11 @@ async def proxy_codex_models(request: Request) -> Response:
             "server_error",
             f"Upstream /models returned non-JSON body: {redact_text(resp.text)[:200]}",
         )
-    raw = payload.get("data", []) if isinstance(payload, dict) else []
+    raw = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return openai_json_error(
+            "server_error", "Upstream /models returned an invalid model catalog; expected a data array.", status=502,
+        )
     openai_items: list[dict[str, Any]] = []
     codex_items: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -647,11 +803,13 @@ async def codex_healthz(request: Request) -> Response:
             except ValueError as exc:
                 logger.warning("codex_healthz upstream 200 with non-JSON body: %s", exc)
             else:
-                upstream_ok = True
-                data = payload.get("data", []) if isinstance(payload, dict) else []
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if not isinstance(data, list):
+                    raise ValueError("Upstream /models returned an invalid model catalog; expected a data array.")
                 model_count = sum(1 for model in data if isinstance(model, dict) and _model_supports_responses(model))
+                upstream_ok = True
         elif resp.status_code in (401, 403):
-            hint = "token may be expired; re-run scripts/extract-token.ps1 then docker compose restart proxy"
+            hint = "token may be expired; re-run scripts/extract-token.ps1 then docker compose up -d --force-recreate proxy"
     except Exception as exc:
         logger.warning("codex_healthz upstream check failed: %s", redact_text(str(exc)))
     body: dict[str, Any] = {

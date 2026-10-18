@@ -21,6 +21,11 @@ _CLAUDE_STRIP_HEADERS = frozenset(
         "authorization",
         "x-api-key",
         "user-agent",
+        # The relay owns these values. Remove every incoming casing before
+        # injecting them, rather than creating duplicate HTTP header names.
+        "copilot-integration-id",
+        "editor-version",
+        "x-request-id",
         # Defensive: never forward client-supplied cookies upstream. Claude Code
         # doesn't send them, but anything else hitting the loopback port might.
         "cookie",

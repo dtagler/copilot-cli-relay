@@ -4,6 +4,7 @@ import gzip
 import json
 
 import httpx
+import pytest
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
@@ -35,6 +36,89 @@ def _settings(log_bodies: bool = True) -> Settings:
         codex_session_id="session-1",
         codex_machine_id="a" * 64,
     )
+
+
+@pytest.mark.parametrize("kind", ["function", "custom"])
+def test_streamed_tool_call_result_and_final_answer_preserve_identity(kind):
+    call = {
+        "type": "function_call" if kind == "function" else "custom_tool_call",
+        "id": "item_fixture", "call_id": "call_fixture", "name": "read_fixture",
+        ("arguments" if kind == "function" else "input"): "{}",
+    }
+    result = {
+        "type": "function_call_output" if kind == "function" else "custom_tool_call_output",
+        "call_id": "call_fixture", "output": "fixture-marker",
+    }
+    tool = {"type": kind, "name": "read_fixture", "description": "Read the fixture"}
+    if kind == "function":
+        tool["parameters"] = {"type": "object", "properties": {}}
+    continuation = [
+        {"type": "reasoning", "encrypted_content": "synthetic-fixture-ciphertext"},
+        call,
+        result,
+        {"role": "user", "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="},
+        ]},
+    ]
+    requests = []
+
+    def sse(event):
+        return f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+
+    first_stream = sse({"type": "response.output_item.done", "output_index": 0, "item": call})
+    first_stream += sse({
+        "type": "response.completed",
+        "response": {"id": "response_fixture_1", "status": "completed", "output": [call]},
+    })
+    final_stream = sse({
+        "type": "response.completed",
+        "response": {"id": "response_fixture_2", "status": "completed", "output": [
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "fixture-marker"},
+            ]},
+        ]},
+    })
+
+    def upstream(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        assert payload["tools"] == [tool]
+        if len(requests) == 1:
+            return httpx.Response(200, content=first_stream)
+        assert request.headers["x-initiator"] == "agent"
+        assert "previous_response_id" not in payload
+        assert payload["input"] == continuation
+        return httpx.Response(200, content=final_stream)
+
+    client, _app = _make_client(upstream, log_bodies=False)
+    with client:
+        first = client.post("/codex/v1/responses", json={
+            "model": "test-model", "stream": True, "input": "Read the fixture", "tools": [tool],
+        })
+        assert first.status_code == 200
+        assert first.content == first_stream
+        final = client.post("/codex/v1/responses", json={
+            "model": "test-model", "stream": True, "input": continuation,
+            "tools": [tool], "previous_response_id": "response_fixture_1",
+        })
+        assert final.status_code == 200
+        assert final.content == final_stream
+    assert len(requests) == 2
+
+
+def test_required_tool_choice_removed_only_when_all_tools_were_stripped():
+    for retained in ([], [{"type": "function", "name": "read_fixture"}]):
+        body, _, _, _ = codex_mod._parse_codex_request(json.dumps({
+            "model": "test-model", "tools": [{"type": "image_generation"}, *retained],
+            "tool_choice": "required",
+        }).encode(), request_id="test")
+        payload = json.loads(body)
+        if retained:
+            assert payload["tools"] == retained
+            assert payload["tool_choice"] == "required"
+        else:
+            assert "tools" not in payload
+            assert "tool_choice" not in payload
 
 
 def _make_client(handler, *, log_bodies: bool = True):
@@ -518,7 +602,11 @@ def test_codex_compact_synthetic_fallback_on_404():
             json={
                 "id": "resp_summary",
                 "object": "response",
-                "output": [{"type": "message", "content": [{"type": "output_text", "text": "summary"}]}],
+                "status": "completed",
+                "output": [{
+                    "type": "message", "role": "assistant", "status": "completed",
+                    "content": [{"type": "output_text", "text": "summary"}],
+                }],
                 "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
             },
         )
@@ -830,7 +918,14 @@ def test_codex_compact_synthetic_handles_string_input_and_copies_optional_fields
         calls.append((str(request.url), json.loads(request.content)))
         if str(request.url) == "https://upstream.test/responses/compact":
             return httpx.Response(404, content=b"not found")
-        return httpx.Response(200, json={"output": [], "usage": {"total_tokens": 1}})
+        return httpx.Response(200, json={
+            "status": "completed",
+            "output": [{
+                "type": "message", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": "summary"}],
+            }],
+            "usage": {"total_tokens": 1},
+        })
 
     client, _ = _make_client(handler)
     response = client.post(
@@ -938,6 +1033,7 @@ def test_codex_healthz_reports_auth_hint_and_handles_exceptions():
     assert auth_response.json()["upstream_ok"] is False
     assert auth_response.json()["upstream_status"] == 401
     assert "token may be expired" in auth_response.json()["hint"]
+    assert "docker compose up -d --force-recreate proxy" in auth_response.json()["hint"]
 
     def error_handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("health failed")
