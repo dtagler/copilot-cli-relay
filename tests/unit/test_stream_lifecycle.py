@@ -65,7 +65,10 @@ async def test_no_ping_inside_fragmented_event(monkeypatch, prefix, suffix):
     polled_after_timeouts = asyncio.Event()
 
     class Source:
-        async def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        async def aiter_raw(self):
             yield prefix
             await release.wait()
             yield suffix
@@ -105,7 +108,10 @@ async def test_ping_after_complete_event_does_not_cancel_reader(monkeypatch):
     last = b"data: last\n\n"
 
     class Source:
-        async def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        async def aiter_raw(self):
             yield first
             await release.wait()
             yield last
@@ -127,7 +133,10 @@ async def test_early_close_joins_producer(monkeypatch, fill_queue):
     finalized = asyncio.Event()
 
     class Source:
-        async def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        async def aiter_raw(self):
             try:
                 for index in range(30 if fill_queue else 1):
                     if index == 9:
@@ -151,7 +160,10 @@ async def test_disconnect_is_terminal_only_after_producer_finalizes():
     finalized = asyncio.Event()
 
     class Source:
-        async def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        async def aiter_raw(self):
             try:
                 started.set()
                 yield b"data: first\n\n"
@@ -190,7 +202,10 @@ async def test_immediate_disconnect_closes_both_channel_endpoints(monkeypatch):
             return True
 
     class Source:
-        async def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        async def aiter_raw(self):
             yield b"data: unused\n\n"
 
     async with aclosing(proxy_shared.chunks_with_keepalive(Source(), Disconnected())) as chunks:
@@ -356,7 +371,10 @@ async def test_cancellation_during_producer_finalization_is_not_swallowed():
     finalized = asyncio.Event()
 
     class Source:
-        async def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        async def aiter_raw(self):
             try:
                 yield b"data: first\n\n"
                 await asyncio.Event().wait()

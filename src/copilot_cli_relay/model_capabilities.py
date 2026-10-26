@@ -17,6 +17,7 @@ import httpx
 from .config import Settings
 from .headers import build_claude_outbound_headers
 from .logging_setup import logger, redact_text
+from .proxy_shared import fetch_catalog
 
 # How long a fetched /models snapshot stays fresh before a refresh is attempted.
 CAPS_TTL_SECS = 300.0
@@ -161,7 +162,10 @@ class ModelCapabilityCache:
             editor_version=settings.editor_version,
         )
         headers["Accept"] = "application/json"
-        resp = await client.get(f"{settings.api_base}/models", headers=headers, timeout=timeout)
+        resp = await fetch_catalog(
+            client, f"{settings.api_base}/models", headers=headers, timeout=timeout,
+            max_bytes=settings.max_catalog_bytes,
+        )
         if resp.status_code != 200:
             raise RuntimeError(f"/models returned status {resp.status_code}")
         return build_effort_snapshot(resp.json())

@@ -21,9 +21,13 @@ from .proxy_shared import (
     UPSTREAM_TIMEOUT,
     UpstreamStreamingResponse,
     chunks_with_keepalive,
+    close_response,
+    fetch_catalog,
     filter_response_headers,
     passthrough_response,
+    protect_response,
     read_bounded,
+    read_complete_bounded,
 )
 
 COMPACTION_PROMPT = """You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
@@ -36,7 +40,6 @@ Include:
 
 Be concise, structured, and focused on helping the next LLM seamlessly continue the work."""
 
-_DEFAULT_CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 _REASONING_EFFORT_DESCRIPTIONS = {
     "none": "Disables reasoning",
     "minimal": "Minimal reasoning",
@@ -232,6 +235,7 @@ async def _send_non_streaming(
         logger.warning("upstream Codex error request_id=%s err=%s", request_id, safe)
         return openai_json_error("server_error", f"Upstream error: {safe}")
 
+    protect_response(resp)
     try:
         if resp.status_code >= 400:
             try:
@@ -247,7 +251,7 @@ async def _send_non_streaming(
                 err_bytes = b""
             return _build_openai_upstream_error(resp.status_code, resp.headers, err_bytes, request_id, route)
         try:
-            await resp.aread()
+            response_body = await read_complete_bounded(resp, get_settings().max_response_bytes)
         except httpx.TimeoutException as exc:
             safe = redact_text(str(exc))
             logger.warning("upstream Codex timeout request_id=%s err=%s", request_id, safe)
@@ -261,8 +265,8 @@ async def _send_non_streaming(
             logger.warning("upstream Codex error request_id=%s err=%s", request_id, safe)
             return openai_json_error("server_error", f"Upstream error: {safe}")
     finally:
-        await resp.aclose()
-    return passthrough_response(resp)
+        await close_response(resp)
+    return passthrough_response(resp, response_body)
 
 
 async def _codex_stream_response(
@@ -288,6 +292,7 @@ async def _codex_stream_response(
         logger.warning("upstream Codex stream connect error request_id=%s err=%s", request_id, safe)
         return openai_json_error("server_error", f"Upstream stream error: {safe}")
 
+    protect_response(upstream)
     if upstream.status_code >= 400:
         upstream_status = upstream.status_code
         try:
@@ -302,7 +307,7 @@ async def _codex_stream_response(
                 )
                 err_bytes = b""
         finally:
-            await upstream.aclose()
+            await close_response(upstream)
         return _build_openai_upstream_error(
             upstream_status,
             upstream.headers,
@@ -335,7 +340,7 @@ async def _codex_stream_response(
             logger.warning("Codex stream error request_id=%s err=%s", request_id, safe)
             yield openai_sse_error_event("server_error", f"Upstream stream error: {safe}")
         finally:
-            await upstream.aclose()
+            await close_response(upstream)
 
     response_headers = filter_response_headers(
         upstream.headers,
@@ -635,6 +640,13 @@ async def proxy_codex_responses_compact(request: Request) -> Response:
     )
     if native.status_code != 404:
         return native
+    if not settings.enable_synthetic_compaction:
+        return openai_json_error(
+            "not_found_error",
+            "Native compaction is unavailable. Unqualified synthetic compaction is disabled; "
+            "start a new conversation or explicitly opt in after reviewing the documented limitations.",
+            status=404,
+        )
     logger.debug("upstream /responses/compact returned 404; using synthetic compact request_id=%s", request_id)
     return await _synthetic_compact(request=request, parsed=parsed, request_id=request_id)
 
@@ -650,9 +662,10 @@ def _model_context_window(model: dict[str, Any]) -> int:
     if isinstance(limits, dict):
         for key in ("max_context_window_tokens", "max_context_window", "context_window"):
             value = limits.get(key)
-            if isinstance(value, int) and value > 0:
+            if type(value) is int and 0 < value <= 10_000_000:
                 return value
-    return 272_000
+    # Unknown is not evidence of a large context window.
+    return 8_192
 
 
 def _codex_reasoning_levels(model: dict[str, Any]) -> list[dict[str, str]]:
@@ -667,12 +680,10 @@ def _codex_reasoning_levels(model: dict[str, Any]) -> list[dict[str, str]]:
             if not isinstance(value, str):
                 continue
             effort = value.strip().lower()
-            if not effort or effort in seen:
+            if effort not in _REASONING_EFFORT_DESCRIPTIONS or effort in seen:
                 continue
             seen.add(effort)
             efforts.append(effort)
-    if not efforts:
-        efforts = list(_DEFAULT_CODEX_REASONING_EFFORTS)
 
     return [
         {
@@ -698,7 +709,9 @@ def _codex_model_info(model: dict[str, Any], model_id: str) -> dict[str, Any]:
     context_window = _model_context_window(model)
     reasoning_levels = _codex_reasoning_levels(model)
     reasoning_efforts = {level["effort"] for level in reasoning_levels}
-    default_reasoning_level = "medium" if "medium" in reasoning_efforts else reasoning_levels[0]["effort"]
+    default_reasoning_level = (
+        "medium" if "medium" in reasoning_efforts else reasoning_levels[0]["effort"] if reasoning_levels else None
+    )
     return {
         "slug": model_id,
         "display_name": name,
@@ -719,19 +732,22 @@ def _codex_model_info(model: dict[str, Any], model_id: str) -> dict[str, Any]:
         "model_messages": None,
         "supports_reasoning_summaries": False,
         "default_reasoning_summary": "none",
-        "support_verbosity": True,
+        "support_verbosity": False,
         "default_verbosity": "low",
         "apply_patch_tool_type": "freeform",
         "web_search_tool_type": "text",
         "truncation_policy": {"mode": "tokens", "limit": 10_000},
-        "supports_parallel_tool_calls": True,
+        "supports_parallel_tool_calls": False,
         "supports_image_detail_original": False,
         "context_window": context_window,
         "max_context_window": context_window,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
         "input_modalities": _codex_input_modalities(model),
-        "supports_search_tool": True,
+        "supports_search_tool": False,
+        # Only explicit, per-model operator qualification can enable options
+        # not established by the upstream fields consumed above.
+        **get_settings().codex_model_overrides.get(model_id, {}),
     }
 
 
@@ -741,7 +757,10 @@ async def proxy_codex_models(request: Request) -> Response:
     request_id = str(uuid.uuid4())
     headers = _build_codex_headers(request, request_id=request_id, initiator="user", streaming=False)
     try:
-        resp = await client.get(f"{settings.api_base}/models", headers=headers, timeout=30.0)
+        resp = await fetch_catalog(
+            client, f"{settings.api_base}/models", headers=headers, timeout=10.0,
+            max_bytes=settings.max_catalog_bytes,
+        )
     except httpx.HTTPError as exc:
         return openai_json_error("server_error", f"Upstream /models error: {redact_text(str(exc))}")
     if resp.status_code != 200:
@@ -749,6 +768,7 @@ async def proxy_codex_models(request: Request) -> Response:
             _openai_kind_for_status(resp.status_code),
             f"Upstream /models {resp.status_code}: {redact_text(resp.text)[:300]}",
             status=resp.status_code,
+            headers=_forwardable_error_headers(resp.headers),
         )
     try:
         payload = resp.json()
@@ -762,8 +782,11 @@ async def proxy_codex_models(request: Request) -> Response:
         return openai_json_error(
             "server_error", "Upstream /models returned an invalid model catalog; expected a data array.", status=502,
         )
+    if len(raw) > settings.max_catalog_models:
+        return openai_json_error("server_error", "Upstream catalog exceeds the model-count limit.", status=502)
     openai_items: list[dict[str, Any]] = []
     codex_items: list[dict[str, Any]] = []
+    output_bytes = len(b'{"object":"list","data":[],"models":[]}')
     seen_ids: set[str] = set()
     for model in raw:
         if not isinstance(model, dict) or not _model_supports_responses(model):
@@ -772,13 +795,26 @@ async def proxy_codex_models(request: Request) -> Response:
         if not isinstance(mid, str) or not mid or mid in seen_ids:
             continue
         seen_ids.add(mid)
-        openai_items.append({
+        openai_item = {
             "id": mid,
             "object": "model",
             "created": 0,
             "owned_by": model.get("vendor") if isinstance(model.get("vendor"), str) else "github-copilot",
-        })
-        codex_items.append(_codex_model_info(model, mid))
+        }
+        codex_item = _codex_model_info(model, mid)
+        try:
+            output_bytes += len(json.dumps(openai_item, ensure_ascii=False, separators=(",", ":")).encode())
+            output_bytes += len(json.dumps(codex_item, ensure_ascii=False, separators=(",", ":")).encode())
+        except (ValueError, UnicodeError):
+            return openai_json_error("server_error", "Upstream catalog contains invalid text.", status=502)
+        if openai_items:
+            output_bytes += 2  # One comma in each array.
+        if output_bytes > settings.max_response_bytes:
+            return openai_json_error("server_error", "Generated catalog exceeds the response size limit.", status=502)
+        openai_items.append(openai_item)
+        codex_items.append(codex_item)
+    if output_bytes > settings.max_response_bytes:
+        return openai_json_error("server_error", "Generated catalog exceeds the response size limit.", status=502)
     return JSONResponse({"object": "list", "data": openai_items, "models": codex_items})
 
 
@@ -791,10 +827,12 @@ async def codex_healthz(request: Request) -> Response:
     model_count = 0
     hint: str | None = None
     try:
-        resp = await client.get(
+        resp = await fetch_catalog(
+            client,
             f"{settings.api_base}/models",
             headers=_build_codex_headers(request, request_id=request_id, initiator="user", streaming=False),
             timeout=10.0,
+            max_bytes=settings.max_catalog_bytes,
         )
         upstream_status = resp.status_code
         if resp.status_code == 200:

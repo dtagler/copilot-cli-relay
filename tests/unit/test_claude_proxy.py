@@ -877,7 +877,10 @@ async def test_chunks_with_keepalive_emits_ping(monkeypatch):
     monkeypatch.setattr(proxy_shared_mod, "PING_INTERVAL_SECS", 0.02)
 
     class FakeUpstream:
-        def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        def aiter_raw(self):
             async def gen():
                 # Sleep long enough that several pings fire before/after.
                 await asyncio.sleep(0.2)
@@ -906,7 +909,10 @@ async def test_chunks_with_keepalive_chunk_arrives_after_ping(monkeypatch):
     monkeypatch.setattr(proxy_shared_mod, "PING_INTERVAL_SECS", 0.02)
 
     class FakeUpstream:
-        def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        def aiter_raw(self):
             async def gen():
                 await asyncio.sleep(0.1)  # several pings worth
                 yield b"chunk-1"
@@ -937,7 +943,10 @@ async def test_chunks_with_keepalive_chunk_arrives_after_ping(monkeypatch):
 @pytest.mark.asyncio
 async def test_chunks_with_keepalive_disconnect():
     class FakeUpstream:
-        def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        def aiter_raw(self):
             async def gen():
                 await asyncio.sleep(10)
                 yield b"never"
@@ -956,7 +965,10 @@ async def test_chunks_with_keepalive_disconnect():
 @pytest.mark.asyncio
 async def test_chunks_with_keepalive_finishes_cleanly():
     class FakeUpstream:
-        def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        def aiter_raw(self):
             async def gen():
                 yield b"a"
                 yield b"b"
@@ -978,7 +990,10 @@ async def test_chunks_with_keepalive_producer_exception_logged_and_terminates(ca
     loop must terminate cleanly and the failure must be logged."""
 
     class FakeUpstream:
-        def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        def aiter_raw(self):
             async def gen():
                 yield b"first"
                 raise httpx.ReadError("upstream went away")
@@ -1131,7 +1146,10 @@ def test_chunks_with_keepalive_redacts_producer_exception_in_log(caplog):
     import asyncio
 
     class FakeUpstream:
-        def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        def aiter_raw(self):
             async def gen():
                 yield b"first"
                 raise httpx.ReadError("Authorization: Bearer leaked-pump-token-99999")
@@ -1247,7 +1265,10 @@ def test_read_bounded_truncates_at_cap():
     big = b"x" * 100_000
 
     class FakeResp:
-        async def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        async def aiter_raw(self):
             yield big
             yield big  # would push beyond cap if not truncated
 

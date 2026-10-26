@@ -59,7 +59,7 @@ function Get-DesktopRelayConfig {
     if ([string]::IsNullOrWhiteSpace($Model) -or $Model -match '[\x00-\x1f\x7f]') {
         throw 'Model must be a nonempty model ID without control characters.'
     }
-    if ($ProviderId -notmatch '^[A-Za-z][A-Za-z0-9_-]{0,63}$' -or
+    if ($ProviderId -notmatch '\A[A-Za-z][A-Za-z0-9_-]{0,63}\z' -or
         $ProviderId -in @('openai', 'ollama', 'lmstudio', 'amazon-bedrock')) {
         throw 'Use a non-reserved provider ID containing only letters, digits, underscores, or hyphens.'
     }
@@ -84,6 +84,8 @@ name = "GitHub Copilot for Codex in ChatGPT"
 base_url = $urlLiteral
 model_catalog_url = $catalogLiteral
 wire_api = "responses"
+# Use harness-managed /compact, not the standalone /responses/compact endpoint.
+capabilities.remote_compaction = "unsupported"
 supports_websockets = false
 
 # This is a non-secret local token. The relay supplies upstream authentication.
@@ -101,7 +103,7 @@ function Test-DesktopRelay {
         [string]$Model,
         [scriptblock]$Fetch = {
             param($Uri)
-            Invoke-RestMethod -Uri $Uri -NoProxy -TimeoutSec 15 -ErrorAction Stop
+            Invoke-RestMethod -Uri $Uri -NoProxy -MaximumRedirection 0 -TimeoutSec 15 -ErrorAction Stop
         }
     )
     $uri = Get-DesktopRelayUri $BaseUrl
@@ -112,7 +114,9 @@ function Test-DesktopRelay {
     }
     # A 200 HTTP status or ok=true alone does not establish upstream health.
     $count = $health.response_models
-    if ($health.upstream_ok -ne $true -or $health.upstream_status -ne 200 -or
+    if ($health.upstream_ok -isnot [bool] -or $health.upstream_ok -ne $true -or
+        ($health.upstream_status -isnot [int] -and $health.upstream_status -isnot [long]) -or
+        $health.upstream_status -ne 200 -or
         ($count -isnot [int] -and $count -isnot [long]) -or $count -lt 1) {
         throw 'Relay is reachable but Copilot health or the Responses model count is not healthy.'
     }
@@ -136,35 +140,181 @@ function Test-DesktopRelay {
     }
 }
 
+function Get-DesktopPackage {
+    if (-not (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) {
+        throw 'Windows Desktop package discovery is unavailable. No installation was attempted.'
+    }
+    Get-AppxPackage -Name OpenAI.Codex -ErrorAction Stop | Select-Object -First 1
+}
+
+function Get-DesktopCatalogRequestPattern {
+    # Codex appends client-version query parameters during catalog refresh.
+    return '\AGET /codex/v1/models(?:\?[^ \r\n]*)? HTTP/1\.[01]\r\n'
+}
+
+function Test-DesktopCatalogMarker {
+    param([object]$Catalog, [string]$Model, [string]$Marker)
+    $models = if ($Catalog -is [Array]) { $Catalog } else { $Catalog.models }
+    $selected = @($models | Where-Object { $_.slug -ceq $Model })
+    return $selected.Count -eq 1 -and $selected[0].display_name -ceq $Marker
+}
+
+function Read-DesktopDiagnosticBytes {
+    param(
+        [IO.Stream]$Stream,
+        [ValidateRange(1, 4194304)][int]$MaxBytes = 4194304,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
+    )
+    $buffer = [byte[]]::new(16384)
+    $output = [IO.MemoryStream]::new()
+    try {
+        while ($true) {
+            $count = $Stream.ReadAsync($buffer, 0, $buffer.Length, $CancellationToken).GetAwaiter().GetResult()
+            if ($count -eq 0) { break }
+            if ($output.Length + $count -gt $MaxBytes) { throw 'Diagnostic response exceeds its byte limit.' }
+            $output.Write($buffer, 0, $count)
+        }
+        return ,$output.ToArray()
+    } finally {
+        $output.Dispose()
+        $Stream.Dispose()
+    }
+}
+
+function Get-DesktopDiagnosticCatalog {
+    param([Uri]$Uri)
+    $null = Get-DesktopRelayUri ($Uri.AbsoluteUri -replace '/models\z', '')
+    if ($Uri.AbsolutePath -ne '/codex/v1/models') { throw 'Expected local model catalog route.' }
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.UseProxy = $false
+    $handler.AllowAutoRedirect = $false
+    $handler.AutomaticDecompression = [Net.DecompressionMethods]::None
+    $client = [Net.Http.HttpClient]::new($handler)
+    $deadline = [Threading.CancellationTokenSource]::new(15000)
+    $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $Uri)
+    $null = $request.Headers.TryAddWithoutValidation('Accept-Encoding', 'identity')
+    $response = $null
+    try {
+        $response = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+            $deadline.Token).GetAwaiter().GetResult()
+        if ([int]$response.StatusCode -ne 200) { throw 'Catalog HTTP request failed.' }
+        if (@($response.Content.Headers.ContentEncoding | Where-Object { $_ -ne 'identity' }).Count) {
+            throw 'Compressed diagnostic catalogs are not accepted.'
+        }
+        if ($response.Content.Headers.ContentLength -gt 4MB) { throw 'Diagnostic response exceeds its byte limit.' }
+        $stream = $response.Content.ReadAsStreamAsync($deadline.Token).GetAwaiter().GetResult()
+        $bytes = Read-DesktopDiagnosticBytes -Stream $stream -CancellationToken $deadline.Token
+        return [Text.UTF8Encoding]::new($false, $true).GetString($bytes) | ConvertFrom-Json -Depth 100
+    } catch {
+        throw 'Local catalog fetch failed validation, size, encoding, or deadline checks; body suppressed.'
+    } finally {
+        if ($response) { $response.Dispose() }
+        $request.Dispose()
+        $deadline.Dispose()
+        $client.Dispose()
+    }
+}
+
+function Invoke-DesktopEngineVersion {
+    param(
+        [string]$Engine,
+        [ValidateRange(1, 30000)][int]$TimeoutMs = 5000,
+        [string[]]$Arguments = @('--version')
+    )
+    if (-not (Test-Path -LiteralPath $Engine -PathType Leaf)) {
+        throw 'Desktop bundled engine not found. Check the installed app layout.'
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = [Diagnostics.ProcessStartInfo]::new()
+    $process.StartInfo.FileName = $Engine
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) { $process.StartInfo.ArgumentList.Add($argument) }
+    $started = $false
+    try {
+        $started = $process.Start()
+        # Read at most cap + 1 characters per pipe, never unbounded ReadToEnd.
+        $stdout = [char[]]::new(4097)
+        $stderr = [char[]]::new(4097)
+        $outTask = $process.StandardOutput.ReadBlockAsync($stdout, 0, $stdout.Length)
+        $errTask = $process.StandardError.ReadBlockAsync($stderr, 0, $stderr.Length)
+        if (-not $process.WaitForExit($TimeoutMs)) {
+            throw 'Desktop engine version probe timed out.'
+        }
+        if (-not $outTask.Wait(1000) -or -not $errTask.Wait(1000)) {
+            throw 'Desktop engine version output did not close.'
+        }
+        if ($process.ExitCode -ne 0) { throw 'Desktop engine version probe failed.' }
+        if ($outTask.Result -gt 4096 -or $errTask.Result -gt 4096) {
+            throw 'Desktop engine version output exceeded the diagnostic limit.'
+        }
+        $version = [string]::new($stdout, 0, $outTask.Result).Trim()
+        if ($version -notmatch '\Acodex-cli [A-Za-z0-9.+_-]+\z') {
+            throw 'Desktop engine returned an unexpected version format.'
+        }
+        return $version
+    } finally {
+        # Only the process created by this probe, never the running desktop app.
+        if ($started -and -not $process.HasExited) {
+            $process.Kill($true)
+            $null = $process.WaitForExit(1000)
+        }
+        $process.Dispose()
+    }
+}
+
+function Get-DesktopRunningState {
+    param(
+        [string]$InstallLocation,
+        [scriptblock]$ListProcesses = { Get-Process -Name ChatGPT -ErrorAction SilentlyContinue }
+    )
+    $processes = @(& $ListProcesses)
+    if (-not $processes.Count) { return 'not-running-or-unavailable' }
+    $unavailable = $false
+    $paths = @(foreach ($item in $processes) {
+        try {
+            if ($item.Path) { $item.Path } else { $unavailable = $true }
+        } catch { $unavailable = $true }
+    })
+    $prefix = [IO.Path]::GetFullPath($InstallLocation).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if (@($paths | Where-Object { -not $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }).Count) {
+        return 'installed-running-mismatch'
+    }
+    if ($unavailable) { return 'running-path-unavailable' }
+    return 'matches-installed-package'
+}
+
 function Invoke-DesktopRelayHelper {
-    param([bool]$Check, [string]$Model, [string]$ProviderId, [string]$BaseUrl)
-    $powerShellPath = Resolve-DesktopPowerShell
+    param(
+        [bool]$Check, [string]$Model, [string]$ProviderId, [string]$BaseUrl,
+        [scriptblock]$ResolvePowerShell = { Resolve-DesktopPowerShell },
+        [scriptblock]$FindPackage = { Get-DesktopPackage },
+        [scriptblock]$ProbeEngine = { param($Engine) Invoke-DesktopEngineVersion -Engine $Engine },
+        [scriptblock]$CheckRelay = { param($Url, $Id) Test-DesktopRelay -BaseUrl $Url -Model $Id },
+        [scriptblock]$RunningState = { param($Location) Get-DesktopRunningState -InstallLocation $Location }
+    )
+    $powerShellPath = & $ResolvePowerShell
     $snippet = Get-DesktopRelayConfig -Model $Model -ProviderId $ProviderId `
         -BaseUrl $BaseUrl -PowerShellPath $powerShellPath
     if (-not $Check) {
         Write-Output $snippet
         return
     }
-    if (-not (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) {
-        throw 'Windows Desktop package discovery is unavailable. No installation was attempted.'
-    }
-    $package = Get-AppxPackage -Name OpenAI.Codex -ErrorAction Stop |
-        Select-Object -First 1
+    $package = & $FindPackage
     if (-not $package) {
         throw 'Expected Windows app package OpenAI.Codex not found. Check app packaging; no installation was attempted.'
     }
     $engine = Join-Path $package.InstallLocation 'app\resources\codex.exe'
-    if (-not (Test-Path -LiteralPath $engine -PathType Leaf)) {
-        throw 'Desktop bundled engine not found. Check the installed app layout.'
-    }
-    $version = & $engine --version
-    if ($LASTEXITCODE -ne 0) { throw 'The installed Desktop engine version check failed.' }
-    $result = Test-DesktopRelay -BaseUrl $BaseUrl -Model $Model
+    $version = & $ProbeEngine $engine
+    $result = & $CheckRelay $BaseUrl $Model
     Write-Output "ChatGPT app package (OpenAI.Codex): $($package.Version) ($($package.Architecture))"
     Write-Output "Bundled engine: $($version -join ' ')"
+    Write-Output "Running app: $(& $RunningState $package.InstallLocation)"
     Write-Output "Copilot healthy; model present in both catalogs ($($result.CodexModels) Codex entries)."
     Write-Output 'Prerequisite checks passed. This does NOT verify the active app Codex provider or inference.'
-    Write-Output 'Check effective config/profile/catalog precedence, save drafts, restart the ChatGPT app, and run the local Codex pilot.'
+    Write-Output 'Check effective config/profile/catalog precedence, save drafts, restart the ChatGPT app, and verify a local Codex chat.'
 }
 
 # Dot-sourcing exposes pure helpers for the dependency-free PowerShell tests.

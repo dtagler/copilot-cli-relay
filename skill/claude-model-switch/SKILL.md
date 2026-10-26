@@ -7,40 +7,38 @@ description: Switch between Claude Code models exposed by copilot-cli-relay. Use
 
 Switch between Claude Code models using the built-in `/model` command. Present Claude models clearly and help the user pick the right one. This skill is Claude-specific; Codex/OpenAI model selection is configured through Codex provider settings, not the Claude `/model` command.
 
-## Available Models
+## Discover available models
 
-| Shorthand     | Model ID                          | Context  |
-|---------------|-----------------------------------|----------|
-| opus-5        | `claude-opus-5`                  | 1M       |
-| opus-4.8      | `claude-opus-4-8`                | 1M       |
-| opus-4.7      | `claude-opus-4-7`                | 1M       |
-| opus-4.6      | `claude-opus-4-6`                | 1M       |
-| sonnet-5      | `claude-sonnet-5`                | 1M       |
-| sonnet-4.6    | `claude-sonnet-4-6`              | 1M       |
-| haiku-4.5     | `claude-haiku-4-5`               | 200K     |
+Read the running relay's `/claude/v1/models` catalog before recommending a model.
+Use the configured loopback port, normally:
+
+```powershell
+$catalog = Invoke-RestMethod -Uri 'http://127.0.0.1:4141/claude/v1/models' -NoProxy -MaximumRedirection 0 -TimeoutSec 15
+$catalog.data | Select-Object id, display_name
+```
+
+This is metadata discovery, not inference. Do not read `.env`, extract credentials,
+install software, or start/reconfigure the relay to list models. If the relay is
+unavailable, say current availability could not be verified. Do not present a
+remembered model list as live or guarantee account access.
 
 ## Behavior
 
-When the user invokes this skill:
+With an argument, match the requested model to the returned IDs and give the
+exact built-in `/model` command. Without an argument, show the returned models
+and ask which one the user wants. Report unavailable exact selections rather
+than silently substituting another model.
 
-1. **With an argument** — match it to a Claude model ID (exact or shorthand) and tell the user the exact `/model` command to run. For example, if they say `/claude-model-switch opus47`, respond with: "Run `/model claude-opus-4-7` to switch."
-
-2. **Without an argument** — display the table of available models and ask which one they want.
+The relay's Claude catalog does not contain context-window metadata. Do not
+invent context sizes or copy old context-window claims into the result.
 
 ## Shorthand Matching
 
-Accept flexible shorthands. Strip dots, dashes, and spaces, then match case-insensitively:
-
-- `opus5`, `opus-5`, `opus 5` → `claude-opus-5`
-- `opus48`, `opus-4.8`, `opus 4.8` → `claude-opus-4-8`
-- `opus47`, `opus-4.7`, `opus 4.7` → `claude-opus-4-7`
-- `opus46`, `opus-4.6`, `opus 4.6` → `claude-opus-4-6`
-- `sonnet5`, `sonnet-5`, `sonnet 5` → `claude-sonnet-5`
-- `sonnet46`, `sonnet-4.6` → `claude-sonnet-4-6`
-- `haiku45`, `haiku-4.5` → `claude-haiku-4-5`
-- Just `opus` → default to `claude-opus-5` (latest Opus)
-- Just `sonnet` → default to `claude-sonnet-5` (latest Sonnet)
-- Just `haiku` → default to `claude-haiku-4-5` (latest Haiku)
+Normalize dots, dashes, spaces, and an optional `claude` prefix, then compare
+against the live IDs case-insensitively. For example, `opus47` can match
+`claude-opus-4-7` only if that ID was returned. If a family name such as `opus`
+matches multiple versions, ask the user to choose. Do not infer "latest" from a
+fixed table or lexicographic ordering.
 
 ## Important
 

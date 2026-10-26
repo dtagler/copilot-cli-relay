@@ -16,6 +16,8 @@ from .codex_proxy import (
     proxy_codex_responses_compact,
 )
 from .config import get_settings
+from .health import livez, readyz
+from .limits import RequestLimitsMiddleware
 from .logging_setup import configure_logging, logger
 from .model_capabilities import ModelCapabilityCache
 from .security import LocalBrowserGuardMiddleware, LoopbackHostMiddleware
@@ -38,7 +40,10 @@ async def lifespan(app: Starlette):
     # silently route Copilot bearer-token traffic through that intermediary.
     # If you ever genuinely need an outbound proxy, plumb it through an
     # explicit Settings field rather than re-enabling env discovery.
-    app.state.http_client = httpx.AsyncClient(http2=True, trust_env=False)
+    app.state.http_client = httpx.AsyncClient(
+        http2=True, trust_env=False,
+        limits=httpx.Limits(max_connections=settings.max_inflight + 2, max_keepalive_connections=settings.max_inflight),
+    )
     # Caches upstream per-model reasoning_effort capabilities so the Claude
     # effort clamp adapts to new/changed models without a code change.
     app.state.model_caps = ModelCapabilityCache()
@@ -54,8 +59,12 @@ app = Starlette(
     middleware=[
         Middleware(LoopbackHostMiddleware),
         Middleware(LocalBrowserGuardMiddleware),
+        Middleware(RequestLimitsMiddleware),
     ],
     routes=[
+        Route("/livez", livez, methods=["GET"]),
+        Route("/claude/readyz", readyz, methods=["GET"]),
+        Route("/codex/readyz", readyz, methods=["GET"]),
         Route("/claude/v1/messages", proxy_claude_messages, methods=["POST"]),
         Route("/claude/v1/models", proxy_claude_models, methods=["GET"]),
         Route("/codex/v1/responses", proxy_codex_responses, methods=["POST"]),

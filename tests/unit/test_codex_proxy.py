@@ -28,6 +28,8 @@ def _settings(log_bodies: bool = True) -> Settings:
         editor_version="copilot-cli-relay/test",
         log_level="info",
         log_bodies=log_bodies,
+        # These legacy tests exercise the opt-in fallback's complete validation.
+        enable_synthetic_compaction=True,
         codex_integration_id="copilot-developer-cli",
         codex_editor_version="vscode/1.99.0",
         codex_plugin_version="copilot-chat/0.43.2026033101",
@@ -351,7 +353,7 @@ def test_codex_models_filters_to_responses_capable_models():
     assert payload["models"][0]["slug"] == "gpt-5.5"
     assert payload["models"][0]["display_name"] == "GPT-5.5"
     assert payload["models"][0]["supported_in_api"] is True
-    assert payload["models"][0]["supported_reasoning_levels"][-1]["effort"] == "xhigh"
+    assert payload["models"][0]["supported_reasoning_levels"] == []
     assert payload["models"][1]["slug"] == "gpt-hidden"
 
 
@@ -377,13 +379,8 @@ def test_codex_models_includes_codex_model_catalog_shape():
         "slug": "gpt-5.5",
         "display_name": "GPT-5.5",
         "description": "GPT-5.5 via GitHub Copilot.",
-        "default_reasoning_level": "medium",
-        "supported_reasoning_levels": [
-            {"effort": "low", "description": "Fast responses with lighter reasoning"},
-            {"effort": "medium", "description": "Balances speed and reasoning depth"},
-            {"effort": "high", "description": "Greater reasoning depth"},
-            {"effort": "xhigh", "description": "Extra high reasoning depth"},
-        ],
+        "default_reasoning_level": None,
+        "supported_reasoning_levels": [],
         "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": True,
@@ -398,19 +395,19 @@ def test_codex_models_includes_codex_model_catalog_shape():
         "model_messages": None,
         "supports_reasoning_summaries": False,
         "default_reasoning_summary": "none",
-        "support_verbosity": True,
+        "support_verbosity": False,
         "default_verbosity": "low",
         "apply_patch_tool_type": "freeform",
         "web_search_tool_type": "text",
         "truncation_policy": {"mode": "tokens", "limit": 10000},
-        "supports_parallel_tool_calls": True,
+        "supports_parallel_tool_calls": False,
         "supports_image_detail_original": False,
         "context_window": 123456,
         "max_context_window": 123456,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
         "input_modalities": ["text"],
-        "supports_search_tool": True,
+        "supports_search_tool": False,
     }]
     assert response.json()["data"] == [
         {"id": "gpt-5.5", "object": "model", "created": 0, "owned_by": "github-copilot"}
@@ -436,8 +433,8 @@ def test_codex_models_context_window_falls_back_when_limits_missing_or_malformed
     client, _ = _make_client(handler)
     response = client.get("/codex/v1/models")
 
-    assert [model["context_window"] for model in response.json()["models"]] == [272_000, 272_000]
-    assert [model["max_context_window"] for model in response.json()["models"]] == [272_000, 272_000]
+    assert [model["context_window"] for model in response.json()["models"]] == [8_192, 8_192]
+    assert [model["max_context_window"] for model in response.json()["models"]] == [8_192, 8_192]
 
 
 def test_codex_models_uses_live_reasoning_and_vision_capabilities():

@@ -17,6 +17,40 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
+function Invoke-RelayDocker {
+  param([string[]]$Arguments)
+  & docker @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "Docker command failed (exit $LASTEXITCODE); dependent actions were not run."
+  }
+}
+
+function Invoke-RelayContainerAction {
+  param([ValidateSet('start','stop','restart','status','rebuild')][string]$Action)
+  switch ($Action) {
+    'start' {
+      Invoke-RelayDocker -Arguments @('compose','up','-d','proxy')
+      Invoke-RelayDocker -Arguments @('compose','ps','proxy')
+    }
+    'stop' { Invoke-RelayDocker -Arguments @('compose','down') }
+    'restart' {
+      $running = @(Invoke-RelayDocker -Arguments @('compose','ps','-q','proxy'))
+      if (-not $running.Count) {
+        Invoke-RelayDocker -Arguments @('compose','up','-d','proxy')
+      } else {
+        Invoke-RelayDocker -Arguments @('compose','restart','proxy')
+      }
+      Invoke-RelayDocker -Arguments @('compose','ps','proxy')
+    }
+    'status' { Invoke-RelayDocker -Arguments @('compose','ps','proxy') }
+    'rebuild' {
+      Invoke-RelayDocker -Arguments @('compose','build','proxy')
+      Invoke-RelayDocker -Arguments @('compose','up','-d','--no-build','--force-recreate','proxy')
+      Invoke-RelayDocker -Arguments @('compose','ps','proxy')
+    }
+  }
+}
+
 function Get-ItemCount {
   param([object]$Value)
 
@@ -48,7 +82,7 @@ function Test-RelayNamespace {
     $health = Invoke-RestMethod -Uri $HealthUrl -TimeoutSec 5
     $health | ConvertTo-Json -Compress
     if (-not $health.upstream_ok) {
-      Write-Host "WARNING: $Name upstream_ok=false. Token may be stale; run 'pwsh scripts\extract-token.ps1' then 'docker compose up -d --force-recreate proxy' to reload .env." -ForegroundColor Yellow
+      Write-Host "WARNING: $Name upstream_ok=false. Token may be stale; run 'pwsh scripts\extract-token.ps1', verify selected/running image IDs per docs/operations.md, then 'docker compose up -d --no-build --pull never --force-recreate proxy' to reload .env." -ForegroundColor Yellow
       exit 1
     }
   } catch {
@@ -83,7 +117,7 @@ function Test-RelayNamespace {
 $actions = @(
   @{ Key = 'start';   Desc = 'Start container (build only if image missing)' }
   @{ Key = 'stop';    Desc = 'Stop and remove container + network' }
-  @{ Key = 'restart'; Desc = 'Restart to pick up src/ edits (starts if down)' }
+  @{ Key = 'restart'; Desc = 'Restart current production image (starts if down)' }
   @{ Key = 'status';  Desc = 'Show container status + port bind' }
   @{ Key = 'rebuild'; Desc = 'Rebuild image and recreate container' }
   @{ Key = 'claude';  Desc = 'Check Claude routes: /claude/healthz + /claude/v1/models' }
@@ -120,39 +154,8 @@ try {
   Write-Host ''
 
   switch ($action) {
-    'start' {
-      Write-Host "Starting proxy..." -ForegroundColor Cyan
-      docker compose up -d proxy
-      Start-Sleep -Seconds 2
-      docker compose ps proxy
-    }
-
-    'stop' {
-      Write-Host "Stopping proxy..." -ForegroundColor Cyan
-      docker compose down
-    }
-
-    'restart' {
-      $running = (docker compose ps -q proxy 2>$null | Measure-Object).Count
-      if ($running -eq 0) {
-        Write-Host "Container not running - starting fresh..." -ForegroundColor Cyan
-        docker compose up -d proxy
-      } else {
-        Write-Host "Restarting proxy (picks up src/ edits)..." -ForegroundColor Cyan
-        docker compose restart proxy
-      }
-      docker compose ps proxy
-    }
-
-    'status' {
-      docker compose ps proxy
-    }
-
-    'rebuild' {
-      Write-Host "Rebuilding proxy image and recreating container..." -ForegroundColor Cyan
-      docker compose build proxy
-      docker compose up -d --force-recreate proxy
-      docker compose ps proxy
+    { $_ -in @('start','stop','restart','status','rebuild') } {
+      Invoke-RelayContainerAction -Action $action
     }
 
     'claude' {

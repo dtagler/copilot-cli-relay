@@ -26,6 +26,8 @@ def client_factory():
             proxy_port=4141, github_token="gho_test",
             api_base="https://upstream.test", integration_id="copilot-developer-cli",
             editor_version="copilot-cli-relay/test", log_level="info", log_bodies=log_bodies,
+            # Preserve every synthetic fallback regression under explicit opt-in.
+            enable_synthetic_compaction=True,
         ))
 
         @asynccontextmanager
@@ -148,7 +150,10 @@ def test_upstream_error_truncation_does_not_expose_secrets(
 @pytest.mark.parametrize("fragmented", [False, True])
 async def test_bounded_reader_stops_inside_large_chunk_without_reading_tail(fragmented):
     class FakeResponse:
-        async def aiter_bytes(self):
+        is_stream_consumed = False
+        headers = {}
+
+        async def aiter_raw(self):
             if fragmented:
                 yield b"prefix"
             yield b"x" * (1024 * 1024)

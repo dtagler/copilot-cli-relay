@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.ruff_cache/
 *.log
 
 # Secrets — never commit
@@ -15,7 +16,10 @@ __pycache__/
 .idea/
 
 # Tooling / agent config
-.github/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/ci.yml
 
 # OS
 Thumbs.db

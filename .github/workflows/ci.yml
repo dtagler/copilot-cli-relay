@@ -1,0 +1,52 @@
+name: relay-checks
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  python-and-images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build development environment from locked dependencies
+        run: docker build --target development -t copilot-cli-relay:ci-dev .
+      - name: Offline tests, lint, coverage and documentation checks
+        run: |
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+            -e COVERAGE_FILE=/tmp/.coverage -e UV_CACHE_DIR=/tmp/uv-cache copilot-cli-relay:ci-dev /bin/sh -c \
+            'uv lock --check --offline && uv sync --check --frozen --offline --no-install-project --inexact && /app/.venv/bin/ruff check --no-cache src tests scripts && /app/.venv/bin/coverage run --source=copilot_cli_relay -m pytest tests/unit -q -p no:cacheprovider && /app/.venv/bin/coverage report --fail-under=98 && /app/.venv/bin/python scripts/check-docs.py'
+      - name: Validate production Compose without loading credentials
+        shell: pwsh
+        run: ./scripts/check-compose.ps1
+      - name: Build production image
+        run: docker build --target production -t copilot-cli-relay:ci-production .
+      - name: Offline production smoke and graceful shutdown
+        shell: pwsh
+        run: ./scripts/test-image.ps1 -Image copilot-cli-relay:ci-production
+      - name: Offline active-stream shutdown
+        shell: pwsh
+        run: ./scripts/test-stream-shutdown.ps1 -Image copilot-cli-relay:ci-production
+      - name: Rollback adapter and legacy health compatibility
+        shell: pwsh
+        run: ./scripts/test-rollback.ps1 -Image copilot-cli-relay:ci-production
+  windows-helper:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Synthetic PowerShell tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem tests/powershell/test-*.ps1 | Sort-Object Name | ForEach-Object {
+            & $_.FullName
+            if (-not $?) { throw "PowerShell tests failed: $($_.Name)" }
+          }

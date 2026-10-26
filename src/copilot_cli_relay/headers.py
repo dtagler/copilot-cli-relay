@@ -26,6 +26,7 @@ _CLAUDE_STRIP_HEADERS = frozenset(
         "copilot-integration-id",
         "editor-version",
         "x-request-id",
+        "accept-encoding",
         # Defensive: never forward client-supplied cookies upstream. Claude Code
         # doesn't send them, but anything else hitting the loopback port might.
         "cookie",
@@ -88,6 +89,9 @@ def build_claude_outbound_headers(
     out["Editor-Version"] = editor_version
     out["User-Agent"] = editor_version
     out["X-Request-Id"] = request_id or str(uuid.uuid4())
+    # Do not inherit client preferences (for example br or encoding chains) the
+    # relay's bounded decoder cannot honor. HTTPX's default advertises deflate.
+    out["Accept-Encoding"] = "gzip, identity"
 
     # Use case-insensitive presence check — inbound dicts may carry mixed case.
     if not any(k.lower() == "anthropic-version" for k in out):
@@ -116,6 +120,7 @@ def build_codex_outbound_headers(
         "Authorization": f"Bearer {bearer_token}",
         "Content-Type": "application/json",
         "Accept": accept,
+        "Accept-Encoding": "gzip, identity",
         "Copilot-Integration-Id": integration_id,
         "Editor-Version": editor_version,
         "Editor-Plugin-Version": plugin_version,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import zlib
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import aclosing, suppress
 
@@ -40,6 +41,94 @@ _HOP_BY_HOP_RESPONSE_HEADERS = frozenset({
 MAX_UPSTREAM_ERROR_BYTES = 32 * 1024
 
 
+class ResponseTooLarge(httpx.HTTPError):
+    """A complete response exceeded its configured decoded-byte budget."""
+
+class UpstreamCleanupError(httpx.HTTPError, RuntimeError):
+    """Sanitized transport cleanup failure, handled by protocol error paths."""
+
+
+async def read_complete_bounded(resp: httpx.Response, max_bytes: int) -> bytes:
+    """Return a complete body or fail, never return a truncated success."""
+    buf = bytearray()
+    async for chunk in decoded_chunks(resp):
+        if len(buf) + len(chunk) > max_bytes:
+            raise ResponseTooLarge("Upstream response exceeded the configured size limit.")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+async def fetch_catalog(
+    client: httpx.AsyncClient, url: str, *, headers: dict[str, str], timeout: float, max_bytes: int,
+) -> httpx.Response:
+    # Also bounds trickle responses; HTTPX read timeout alone is an idle timeout.
+    response = None
+    body = b""
+    try:
+        with anyio.fail_after(timeout):
+            request = client.build_request("GET", url, headers=headers, timeout=timeout)
+            response = await client.send(request, stream=True)
+            protect_response(response)
+            if response.status_code >= 400:
+                # Preserve known auth/rate-limit statuses even if reading their
+                # diagnostic body fails. Exact-cap content is deliberately omitted.
+                cap = min(max_bytes, MAX_UPSTREAM_ERROR_BYTES)
+                body = await read_bounded(response, cap)
+                if len(body) >= cap:
+                    body = b""
+            else:
+                body = await read_complete_bounded(response, max_bytes)
+    except (TimeoutError, httpx.HTTPError) as exc:
+        if response is None or response.status_code < 400:
+            if isinstance(exc, TimeoutError):
+                raise httpx.ReadTimeout("Upstream catalog deadline exceeded.") from None
+            raise
+        body = b""
+    finally:
+        if response is not None:
+            await close_response(response)
+    return httpx.Response(
+        response.status_code, headers=filter_response_headers(response.headers),
+        content=body, request=response.request,
+    )
+
+
+async def decoded_chunks(response: httpx.Response):
+    """Decode gzip/deflate with bounded output allocations, including SSE.
+
+    HTTPX's aiter_bytes decodes before yielding and its chunk_size does not
+    constrain decompressor allocations. Operate on raw wire bytes instead.
+    """
+    if response.is_stream_consumed:
+        # Pre-buffered mock responses (real stream=True responses are not read).
+        for start in range(0, len(response.content), 65536):
+            yield response.content[start:start + 65536]
+        return
+    encoding = response.headers.get("content-encoding", "identity").lower().strip()
+    if encoding not in {"identity", "", "gzip", "deflate"}:
+        raise httpx.DecodingError("Unsupported upstream content encoding.")
+    decoder = zlib.decompressobj(31 if encoding == "gzip" else 15) if encoding in {"gzip", "deflate"} else None
+    try:
+        async for raw in response.aiter_raw():
+            if decoder is None:
+                for start in range(0, len(raw), 65536):
+                    yield raw[start:start + 65536]
+                continue
+            while raw:
+                if decoder.eof:
+                    if encoding != "gzip":
+                        raise httpx.DecodingError("Unexpected trailing compressed data.")
+                    decoder = zlib.decompressobj(31)
+                part = decoder.decompress(raw, 65536)
+                raw = decoder.unused_data if decoder.eof else decoder.unconsumed_tail
+                if part:
+                    yield part
+        if decoder is not None and not decoder.eof:
+            raise httpx.DecodingError("Truncated compressed upstream response.")
+    except zlib.error:
+        raise httpx.DecodingError("Invalid compressed upstream response.") from None
+
+
 def _start_cleanup(operation: Callable[[], Awaitable[None]]) -> asyncio.Task[BaseException | None]:
     async def run() -> BaseException | None:
         try:
@@ -48,7 +137,7 @@ def _start_cleanup(operation: Callable[[], Awaitable[None]]) -> asyncio.Task[Bas
             # Python can log an inner shielded task's exception after its
             # caller cancels, even if another waiter retrieves that exception.
             # Return a sanitized failure as a value, not a failed Future.
-            return RuntimeError(redact_text(str(exc))) if isinstance(exc, Exception) else exc
+            return UpstreamCleanupError(redact_text(str(exc))) if isinstance(exc, Exception) else exc
         return None
 
     return asyncio.create_task(run(), name="copilot-relay-stream-cleanup")
@@ -101,6 +190,22 @@ class _CancellationSafeStream(httpx.AsyncByteStream):
         await _await_cleanup(self._close_task)
 
 
+def protect_response(response: httpx.Response) -> None:
+    if not isinstance(response.stream, _CancellationSafeStream):
+        response.stream = _CancellationSafeStream(response.stream)
+
+
+async def close_response(response: httpx.Response) -> None:
+    try:
+        await _await_cleanup(_start_cleanup(response.aclose))
+    except UpstreamCleanupError as exc:
+        # A failed close must not replace a known 401/403/429, size error, or
+        # completed protocol response in a route's finally block. Cancellation
+        # still propagates. EOF close failures during body reading remain HTTP
+        # errors so the caller returns a structured failure instead of success.
+        logger.warning("upstream transport cleanup failed: %s", redact_text(str(exc)))
+
+
 class UpstreamStreamingResponse(StreamingResponse):
     """Close acquired upstream resources even if sending headers/body fails."""
 
@@ -117,7 +222,7 @@ class UpstreamStreamingResponse(StreamingResponse):
         # HTTPX sets response.is_closed BEFORE awaiting stream.aclose(). Merely
         # retrying response.aclose() after cancellation can therefore do nothing.
         # Wrap before consumption so the producer's automatic EOF close is safe.
-        upstream.stream = _CancellationSafeStream(upstream.stream)
+        protect_response(upstream)
 
     async def _close(self) -> None:
         try:
@@ -182,7 +287,8 @@ def filter_response_headers(
     return out
 
 
-def passthrough_response(resp: httpx.Response) -> Response:
+def passthrough_response(resp: httpx.Response, body: bytes | None = None) -> Response:
+    content = resp.content if body is None else body
     dynamic_strip: set[str] = set()
     conn_value = resp.headers.get("connection")
     if conn_value:
@@ -196,15 +302,15 @@ def passthrough_response(resp: httpx.Response) -> Response:
         if lname in _HOP_BY_HOP_RESPONSE_HEADERS or lname in dynamic_strip:
             continue
         raw_headers.append((k.lower(), v))
-    raw_headers.append((b"content-length", str(len(resp.content)).encode("latin-1")))
-    out = Response(content=resp.content, status_code=resp.status_code)
+    raw_headers.append((b"content-length", str(len(content)).encode("latin-1")))
+    out = Response(content=content, status_code=resp.status_code)
     out.raw_headers = raw_headers
     return out
 
 
 async def read_bounded(resp: httpx.Response, max_bytes: int) -> bytes:
     buf = bytearray()
-    async for chunk in resp.aiter_bytes():
+    async for chunk in decoded_chunks(resp):
         buf.extend(chunk[:max_bytes - len(buf)])
         if len(buf) >= max_bytes:
             return bytes(buf)
@@ -229,7 +335,7 @@ async def chunks_with_keepalive(upstream: httpx.Response, request: Request):
 
     async def _producer() -> None:
         try:
-            async with aclosing(upstream.aiter_bytes()) as raw_chunks:
+            async with aclosing(decoded_chunks(upstream)) as raw_chunks:
                 async for raw in raw_chunks:
                     await send.send(raw)
         except anyio.get_cancelled_exc_class():

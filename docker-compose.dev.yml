@@ -1,0 +1,21 @@
+# Independent development stack. Do not merge this with production Compose.
+name: copilot-cli-relay-dev
+services:
+  proxy:
+    build:
+      context: .
+      target: development
+    image: copilot-cli-relay:dev-hardening
+    env_file: [.env]
+    ports: ["127.0.0.1:4142:4141"]
+    volumes:
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+    read_only: true
+    tmpfs: ["/tmp:rw,nosuid,nodev,size=128m"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    pids_limit: 128
+    stop_grace_period: 30s
+    restart: "no"

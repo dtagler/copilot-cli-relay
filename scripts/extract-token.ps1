@@ -137,4 +137,4 @@ if ($aclHardened) {
 } else {
   Write-Host "Wrote $EnvFile (WARNING: ACL not hardened)" -ForegroundColor Yellow
 }
-Write-Host "Now run: docker compose up --build" -ForegroundColor Yellow
+Write-Host "Next: follow README first-time setup, or docs/operations.md for token renewal. For renewal, verify selected/running image IDs before an approved recreation with --no-build --pull never; do not rebuild just to reload .env." -ForegroundColor Yellow

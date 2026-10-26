@@ -1,0 +1,8 @@
+# Apply only after approving rollback to an exact, previously validated local image.
+# Legacy images lack /livez. Keep their compatible HTTP health route while
+# preserving the production loopback binding and other container restrictions.
+services:
+  proxy:
+    image: ${RELAY_ROLLBACK_IMAGE:?Set the previously validated local image ID}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4141/claude/healthz', timeout=3).status==200 else 1)"]

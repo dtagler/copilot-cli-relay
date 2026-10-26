@@ -21,9 +21,13 @@ from .proxy_shared import (
     UPSTREAM_TIMEOUT,
     UpstreamStreamingResponse,
     chunks_with_keepalive,
+    close_response,
+    fetch_catalog,
     filter_response_headers,
     passthrough_response,
+    protect_response,
     read_bounded,
+    read_complete_bounded,
 )
 
 
@@ -318,6 +322,7 @@ async def proxy_claude_messages(request: Request) -> Response:
             logger.warning("upstream error request_id=%s err=%s", request_id, redact_text(str(exc)))
             return anthropic_json_error("api_error", f"Upstream error: {redact_text(str(exc))}")
 
+        protect_response(resp)
         try:
             if resp.status_code >= 400:
                 upstream_status = resp.status_code
@@ -340,7 +345,7 @@ async def proxy_claude_messages(request: Request) -> Response:
                 )
             # Success: read the full body for passthrough.
             try:
-                await resp.aread()
+                response_body = await read_complete_bounded(resp, settings.max_response_bytes)
             except httpx.TimeoutException as exc:
                 safe = redact_text(str(exc))
                 logger.warning("upstream read timeout request_id=%s err=%s", request_id, safe)
@@ -354,14 +359,14 @@ async def proxy_claude_messages(request: Request) -> Response:
                 logger.warning("upstream read error request_id=%s err=%s", request_id, safe)
                 return anthropic_json_error("api_error", f"Upstream error: {safe}")
         finally:
-            await resp.aclose()
+            await close_response(resp)
 
         duration_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "Claude POST /claude/v1/messages -> upstream /v1/messages model=%s status=%d duration_ms=%d request_id=%s stream=0",
             model, resp.status_code, duration_ms, request_id,
         )
-        return passthrough_response(resp)
+        return passthrough_response(resp, response_body)
 
     return await _stream_response(
         client=client, url=upstream_url, body=body, headers=headers,
@@ -448,6 +453,7 @@ async def _stream_response(
         logger.warning("upstream stream connect error request_id=%s err=%s", request_id, safe)
         return anthropic_json_error("api_error", f"Upstream stream error: {safe}")
 
+    protect_response(upstream)
     if upstream.status_code >= 400:
         upstream_status = upstream.status_code
         # Capture rate-limit / auth-challenge headers BEFORE aclose — SDK
@@ -471,7 +477,7 @@ async def _stream_response(
                 )
                 err_bytes = b""
         finally:
-            await upstream.aclose()
+            await close_response(upstream)
         settings = get_settings()
         redacted = redact_bytes(err_bytes, max_bytes=MAX_UPSTREAM_ERROR_BYTES).decode("utf-8", "replace")
         if settings.log_bodies:
@@ -524,7 +530,7 @@ async def _stream_response(
             logger.warning("stream error request_id=%s err=%s", request_id, safe)
             yield anthropic_sse_error_event("api_error", f"Upstream stream error: {safe}")
         finally:
-            await upstream.aclose()
+            await close_response(upstream)
 
     # Forward upstream response headers (request-id correlation, vendor
     # rate-limit hints, etc.) on the streaming success path the same way
@@ -554,7 +560,10 @@ async def proxy_claude_models(request: Request) -> Response:
     )
     headers["Accept"] = "application/json"
     try:
-        resp = await client.get(f"{settings.api_base}/models", headers=headers, timeout=30.0)
+        resp = await fetch_catalog(
+            client, f"{settings.api_base}/models", headers=headers, timeout=10.0,
+            max_bytes=settings.max_catalog_bytes,
+        )
     except httpx.HTTPError as exc:
         return anthropic_json_error("api_error", f"Upstream /models error: {redact_text(str(exc))}")
     if resp.status_code != 200:
@@ -562,6 +571,7 @@ async def proxy_claude_models(request: Request) -> Response:
             _anthropic_kind_for_status(resp.status_code),
             f"Upstream /models {resp.status_code}: {redact_text(resp.text)[:300]}",
             status=resp.status_code,
+            headers={key: value for key, value in resp.headers.items() if key == "retry-after"},
         )
     try:
         payload = resp.json()
@@ -576,7 +586,10 @@ async def proxy_claude_models(request: Request) -> Response:
         return anthropic_json_error(
             "api_error", "Upstream /models returned an invalid model catalog; expected a data array.", status=502,
         )
+    if len(raw) > settings.max_catalog_models:
+        return anthropic_json_error("api_error", "Upstream catalog exceeds the model-count limit.", status=502)
     items: list[dict[str, Any]] = []
+    output_bytes = 0
     seen_ids: set[str] = set()
     for m in raw:
         if not _is_anthropic(m):
@@ -610,19 +623,32 @@ async def proxy_claude_models(request: Request) -> Response:
         if canonical_id in seen_ids:
             continue
         seen_ids.add(canonical_id)
-        items.append({
+        item = {
             "type": "model",
             "id": canonical_id,
             "display_name": name or canonical_id,
             "created_at": "2024-01-01T00:00:00Z",
-        })
+        }
+        try:
+            output_bytes += len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode()) + 1
+            # Account for the repeated first/last IDs before constructing the
+            # complete response. This check is intentionally conservative.
+            ids_bytes = len(json.dumps([items[0]["id"] if items else canonical_id, canonical_id], ensure_ascii=False).encode())
+        except (ValueError, UnicodeError):
+            return anthropic_json_error("api_error", "Upstream catalog contains invalid text.", status=502)
+        if output_bytes + ids_bytes + 64 > settings.max_response_bytes:
+            return anthropic_json_error("api_error", "Generated catalog exceeds the response size limit.", status=502)
+        items.append(item)
     body_out = {
         "data": items,
         "has_more": False,
         "first_id": items[0]["id"] if items else None,
         "last_id": items[-1]["id"] if items else None,
     }
-    return JSONResponse(body_out)
+    response = JSONResponse(body_out)
+    if len(response.body) > settings.max_response_bytes:
+        return anthropic_json_error("api_error", "Generated catalog exceeds the response size limit.", status=502)
+    return response
 
 
 def _is_anthropic(model: object) -> bool:
@@ -638,7 +664,8 @@ async def claude_healthz(request: Request) -> Response:
     upstream_status: int | None = None
     hint: str | None = None
     try:
-        resp = await client.get(
+        resp = await fetch_catalog(
+            client,
             f"{settings.api_base}/models",
             headers=build_claude_outbound_headers(
                 {},
@@ -647,6 +674,7 @@ async def claude_healthz(request: Request) -> Response:
                 editor_version=settings.editor_version,
             ),
             timeout=10.0,
+            max_bytes=settings.max_catalog_bytes,
         )
         upstream_status = resp.status_code
         if resp.status_code == 200:

@@ -1,6 +1,7 @@
 """Runtime configuration parsed from environment variables."""
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import uuid
@@ -19,6 +20,37 @@ def _bool(value: str | None, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _positive_int(name: str, default: int, maximum: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError(f"{name} must be an integer between 1 and {maximum}.") from None
+    if not 1 <= value <= maximum:
+        raise ConfigError(f"{name} must be an integer between 1 and {maximum}.")
+    return value
+
+
+def _model_overrides() -> dict[str, dict[str, bool]]:
+    raw = os.environ.get("COPILOT_CODEX_MODEL_OVERRIDES", "{}")
+    message = "COPILOT_CODEX_MODEL_OVERRIDES must map model IDs to supported Boolean capability overrides."
+    if len(raw) > 65536:
+        raise ConfigError(message)
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        raise ConfigError(message) from None
+    allowed = {"support_verbosity", "supports_parallel_tool_calls", "supports_search_tool"}
+    if not isinstance(parsed, dict) or any(
+        not isinstance(mid, str) or not mid or len(mid) > 128 or not mid.isprintable()
+        or not isinstance(values, dict)
+        or any(key not in allowed or type(value) is not bool for key, value in values.items())
+        for mid, values in parsed.items()
+    ):
+        raise ConfigError(message)
+    return parsed
+
+
 @dataclass(frozen=True)
 class Settings:
     proxy_port: int
@@ -35,6 +67,15 @@ class Settings:
     codex_github_api_version: str = "2026-01-09"
     codex_session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     codex_machine_id: str = field(default_factory=lambda: secrets.token_hex(32))
+    max_request_bytes: int = 16 * 1024 * 1024
+    max_response_bytes: int = 32 * 1024 * 1024
+    max_catalog_bytes: int = 2 * 1024 * 1024
+    max_inflight: int = 8
+    request_body_timeout: int = 30
+    request_timeout: int = 900
+    max_catalog_models: int = 512
+    enable_synthetic_compaction: bool = False
+    codex_model_overrides: dict[str, dict[str, bool]] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -97,6 +138,15 @@ class Settings:
             codex_github_api_version=os.environ.get("COPILOT_CODEX_GITHUB_API_VERSION", "2026-01-09"),
             codex_session_id=os.environ.get("COPILOT_CODEX_SESSION_ID", str(uuid.uuid4())),
             codex_machine_id=os.environ.get("COPILOT_CODEX_MACHINE_ID", secrets.token_hex(32)),
+            max_request_bytes=_positive_int("COPILOT_MAX_REQUEST_BYTES", 16 * 1024 * 1024, 128 * 1024 * 1024),
+            max_response_bytes=_positive_int("COPILOT_MAX_RESPONSE_BYTES", 32 * 1024 * 1024, 128 * 1024 * 1024),
+            max_catalog_bytes=_positive_int("COPILOT_MAX_CATALOG_BYTES", 2 * 1024 * 1024, 16 * 1024 * 1024),
+            max_inflight=_positive_int("COPILOT_MAX_INFLIGHT", 8, 128),
+            request_body_timeout=_positive_int("COPILOT_REQUEST_BODY_TIMEOUT", 30, 600),
+            request_timeout=_positive_int("COPILOT_REQUEST_TIMEOUT", 900, 7200),
+            max_catalog_models=_positive_int("COPILOT_MAX_CATALOG_MODELS", 512, 4096),
+            enable_synthetic_compaction=_bool(os.environ.get("COPILOT_ENABLE_SYNTHETIC_COMPACTION")),
+            codex_model_overrides=_model_overrides(),
         )
 
 

@@ -18,7 +18,7 @@
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/python-3.14+-blue?logo=python&logoColor=white">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-478%20passing-brightgreen?logo=pytest&logoColor=white">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-689%20passing-brightgreen?logo=pytest&logoColor=white">
   <img alt="Coverage" src="https://img.shields.io/badge/coverage-99%25-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?logo=windows11&logoColor=white">
@@ -36,9 +36,9 @@
 
 > ## Disclaimer
 >
-> **Unofficial, unsupported, proof-of-concept.** This project is an independent experiment and is **not affiliated with, endorsed by, or supported by Microsoft, GitHub, Anthropic, or OpenAI**. None of those organizations have reviewed, blessed, or sanctioned it.
+> **Community-maintained, with project-supported client integrations.** This GitHub Copilot relay supports Claude Code, Codex CLI, and Windows Codex desktop integration within the [documented scope](#supported-clients-and-scope). It is **not affiliated with, endorsed by, or supported by Microsoft, GitHub, Anthropic, or OpenAI**.
 >
-> It is **not a product**. There is no warranty, no SLA, no support, and no guarantee of fitness for any purpose. APIs, headers, model availability, and tenant behavior on the upstream services can change at any time and break this proxy without notice.
+> Project support means best-effort maintenance, regression tests, and documented setup and troubleshooting for tested combinations. There is no warranty, SLA, guaranteed response time, or guarantee of fitness for any purpose. APIs, headers, model availability, and tenant behavior on the upstream services can change at any time and break this proxy without notice.
 >
 > **Use at your own risk.** You are solely responsible for ensuring that your use of GitHub Copilot through this proxy complies with your Copilot subscription terms, your employer's acceptable-use policies, and any applicable laws. The authors and contributors accept **no liability** for account suspension, data loss, billing surprises, security incidents, or any other damages arising from use of this software. See [`LICENSE`](LICENSE) for the full no-warranty / no-liability terms.
 
@@ -51,6 +51,12 @@ forwarded to GitHub Copilot's native endpoints, with compatibility rewrites but
 **no conversion between Messages, Chat Completions, and Responses**.
 
 ## Supported clients and scope
+
+The **Codex desktop integration** is a first-class, project-supported client path,
+alongside Claude Code and Codex CLI. Support is bounded by the recorded
+qualification and known limitations, not a claim that every app feature or
+long-session workflow is production-qualified. The [desktop guide](docs/codex-desktop.md#product-name-and-support-boundary)
+defines that boundary.
 
 | Client or surface | Relay integration | Setup |
 |---|---|---|
@@ -71,7 +77,11 @@ and [architecture](ARCHITECTURE.md) for implementation boundaries.
 The [project review](docs/project-review-2026-10-18.md) records four inherited
 runtime findings and their authorized fixes: truncation-safe diagnostics,
 synthetic-summary validation, catalog-shape checks, and authoritative Claude
-headers. Deployment of source changes still requires a relay restart.
+headers. Production source changes require a new validated image and container
+recreation; restarting the old image does not apply source edits.
+The [full-project review](docs/project-review-2026-10-26.md) records the later
+promotion/hardening regression fixes and the distinction between reviewed source
+and the deployed image.
 
 ## How it works
 
@@ -103,7 +113,8 @@ headers. Deployment of source changes still requires a relay restart.
 | Client | Local relay routes | Upstream Copilot routes | Protocol |
 |---|---|---|---|
 | Claude Code | `POST /claude/v1/messages`<br>`GET /claude/v1/models` | `POST /v1/messages`<br>`GET /models` | Anthropic Messages JSON/SSE |
-| Codex CLI and ChatGPT app (local Codex) | `POST /codex/v1/responses`<br>`POST /codex/v1/responses/compact`<br>`GET /codex/v1/models` | `POST /responses`<br>tries `POST /responses/compact`, with a synthetic fallback on 404<br>`GET /models` | OpenAI Responses JSON/SSE |
+| Codex CLI and ChatGPT app (local Codex), including harness `/compact` | `POST /codex/v1/responses`<br>`GET /codex/v1/models` | `POST /responses`<br>`GET /models` | OpenAI Responses JSON/SSE |
+| Legacy compact API, explicit callers only | `POST /codex/v1/responses/compact` | Tries `POST /responses/compact`; synthetic fallback on 404 requires explicit opt-in | OpenAI Responses JSON |
 
 | Relay step | What happens |
 |---|---|
@@ -116,8 +127,10 @@ The proxy keeps each client on its native protocol. Codex's CLI and app clients
 share `/codex/v1/responses`; there is no extra desktop route or app patch. The
 proxy replaces local dummy auth with the GitHub OAuth bearer, adds Copilot
 headers, and forwards SSE incrementally. Keepalives are inserted only between
-complete events. The compaction fallback is an ordinary summary, not a verified
-v2/checkpoint implementation; see the [app limitations](docs/codex-desktop.md#limits).
+complete events. Use harness-managed `/compact` in either Codex client. Setup
+helpers explicitly select local compaction rather than the standalone compact
+endpoint. See [compaction setup and evidence](docs/compaction.md). The legacy API
+route remains available for explicit callers; its synthetic fallback stays off.
 
 Four things make this work cleanly:
 
@@ -200,6 +213,10 @@ With `-Write` and confirmation, the helper refreshes the managed provider,
 tables, and cleans up its obsolete `CODEX_PROXY_API_KEY` user-environment and
 PowerShell-profile setup. Use print-only mode and merge manually if you have
 customized those sections. It is not an app-configuration repair tool.
+Fresh and empty configurations are supported. Automatic merging accepts ordinary,
+commented, and quoted managed table headers, but refuses multiline strings,
+inline/dotted managed definitions, and ambiguous table syntax before writing.
+Use print-only mode and a deliberate manual merge for those layouts.
 
 The provider lives in `~/.codex/config.toml`:
 
@@ -208,6 +225,7 @@ The provider lives in `~/.codex/config.toml`:
 name = "GitHub Copilot via local relay"
 base_url = "http://127.0.0.1:4141/codex/v1"
 wire_api = "responses"
+capabilities.remote_compaction = "unsupported"
 requires_openai_auth = false
 request_max_retries = 4
 stream_max_retries = 10
@@ -284,10 +302,12 @@ Changing shared root defaults also affects CLI launches without an explicit
 profile. Neither helper mode changes credentials, permissions, or environment.
 **Full access is not required to route through the relay.**
 
-The Windows pilot includes a GUI tool round trip, updated-relay bundled-engine
-tests, and a user-confirmed response after the live relay restart. GUI follow-up,
-cancellation/recovery, and reopening remain unverified. A passing `-Check` is
-not proof of those workflows or of inference.
+The recorded Windows validation includes a GUI tool round trip, updated-relay bundled-engine
+tests, and a user-confirmed response after the live relay restart. On October 26,
+2026, the user also confirmed the provider label, actual fixture read, follow-up,
+streamed stop/recovery, and reopening checks passed. These are user-reported,
+not independently observed GUI results; see the [acceptance record](docs/remaining-qualification.md#user-assisted-gui-acceptance).
+A passing `-Check` alone is not proof of those workflows or of inference.
 
 ## Lifecycle helper
 
@@ -302,7 +322,7 @@ pwsh scripts\proxy.ps1
 copilot-cli-relay - pick an action:
   1) start     Start container (build only if image missing)
   2) stop      Stop and remove container + network
-  3) restart   Restart to pick up src/ edits (starts if down)
+  3) restart   Restart current production image (starts if down)
   4) status    Show container status + port bind
   5) rebuild   Rebuild image and recreate container
   6) claude    Check Claude routes: /claude/healthz + /claude/v1/models
@@ -316,14 +336,16 @@ configuration or inference.
 
 | Changed input | Apply it with |
 |---|---|
-| Bind-mounted `src/` code | `docker compose restart proxy` |
-| `.env` token or relay settings | `docker compose up -d --force-recreate proxy` |
+| Production source or dependencies | Build and validate a new image, then recreate after approval |
+| `.env` token or relay settings | Verify image selection, then `docker compose up -d --no-build --pull never --force-recreate proxy` |
 | Dependencies or Dockerfile | Rebuild the image, then recreate the container |
 | App provider configuration | Save your work and fully restart the ChatGPT app |
 
 Container restart does not reload Compose's `env_file`; see
 [Docker's restart reference](https://docs.docker.com/reference/cli/docker/compose/restart/).
 Wait for active requests to finish before restarting or recreating the relay.
+Before recreation, follow the [image-selection check](docs/operations.md#image-selection-before-recreation).
+A Compose tag or `RELAY_IMAGE` override can differ from the running artifact.
 
 ## Claude Model Selection
 
@@ -338,8 +360,8 @@ For consistency, set both the top-level `"model"` and `ANTHROPIC_MODEL` to the s
 A few things to know about the IDs:
 
 - **Use the dash form** (`claude-opus-4-7`, not `claude-opus-4.7`). The proxy canonicalizes `/claude/v1/models` output to dash form because that's the shape Claude Code recognizes as a known Anthropic model — using it unlocks the right request shape (adaptive thinking, etc.). Both forms work upstream, but dash is what you want here.
-- **`effortLevel`** is Claude Code's reasoning-effort knob. The proxy clamps each request to the values the target model actually accepts, read live from Copilot's `/models` capabilities (cached, ~5 min) and falling back to a small built-in table only if `/models` is unreachable. Current Opus and Sonnet models advertise `low`, `medium`, `high`, and `max`; Opus 4.7, Opus 4.8, Opus 5, and Sonnet 5 also advertise `xhigh`. Haiku 4.5 does not support reasoning effort, so the field is stripped. New models and capability changes are handled automatically. Copilot's endpoint expects `output_config.effort` (not a top-level `reasoning_effort`) and `thinking.type: "adaptive"` (not `"enabled"` with a `budget_tokens`), so the proxy rewrites both legacy shapes.
-- **1M context:** Current Opus and Sonnet picker models advertise 1M context directly on their standard model ids. Claude Code may still attach the retired `context-1m-2025-08-07` beta token; the proxy strips that unsupported header without changing the model id. Retired `-1m` internal variants are no longer advertised; existing configurations that pin one are translated to the matching standard model.
+- **`effortLevel`** is Claude Code's reasoning-effort knob. The relay uses live Copilot `/models` capabilities (cached for about five minutes) to clamp or remove effort, with a small built-in fallback when metadata is unavailable. Do not assume a fixed effort list applies to every current model. Compatibility rewrites move legacy `reasoning_effort` to `output_config.effort` and convert legacy enabled thinking to adaptive thinking.
+- **Context limits:** consult the actual model's advertised limits rather than assuming a family-wide context size. The relay retains compatibility for previously documented internal `-1m` IDs and strips the retired `context-1m-2025-08-07` beta header. Those compatibility rules do not promise a particular context window.
 - **Switching mid-session:** `/model claude-sonnet-4-6` inside Claude Code changes the model for the current conversation without editing `settings.json`.
 
 Optional env vars to consider adding to the `"env"` block:
@@ -444,19 +466,19 @@ Optional env vars to consider adding to the `"env"` block:
 ## Troubleshooting
 
 - **`/claude/v1/models` returns no Claude models:** your `COPILOT_INTEGRATION_ID` is wrong, or your org policy doesn't include Claude models for your account.
-- **401 from upstream:** the Copilot token may have expired or rotated. Refresh it with `pwsh scripts\extract-token.ps1`, then recreate the container with `docker compose up -d --force-recreate proxy` so Compose reloads `.env`. If it persists, check account access rather than changing app credentials.
+- **401 from upstream:** the Copilot token may have expired or rotated. Refresh it with `pwsh scripts\extract-token.ps1`, verify the [selected image](docs/operations.md#image-selection-before-recreation) matches the running artifact, then recreate with `docker compose up -d --no-build --pull never --force-recreate proxy` so Compose reloads `.env` without selecting different code. If it persists, check account access rather than changing app credentials.
 - **`COPILOT_GITHUB_TOKEN is required`:** run `extract-token.ps1` first; it writes `.env`.
-- **Source edits not picked up:** the container runs uvicorn without `--reload`. Run `docker compose restart proxy` after editing `src/`. (Bind-mount file events on Windows are also flaky, so the restart is the reliable path.)
-- **`Unable to connect to API (ConnectionRefused)` in Claude Code:** the container isn't running. `docker compose up -d proxy` brings it back. The compose file uses `restart: unless-stopped`, so this should only happen after a clean `docker compose down`.
+- **Source edits not picked up:** production uses an installed wheel with no source mounts. Build and validate a new image, then recreate the container. Only the separate development stack picks up source edits on restart.
+- **`Unable to connect to API (ConnectionRefused)` in Claude Code:** check whether the container is running. Verify the [selected image](docs/operations.md#image-selection-before-recreation) against the recorded deployment, then use `docker compose up -d --no-build --pull never proxy` to start that existing image. Do not infer the cause solely from a connection refusal.
 - **Claude Code posts to `/v1/messages` and gets 404:** your Claude base URL is missing the namespace. Run `pwsh scripts\claude-config.ps1 -Write`, restart Claude Code, and confirm `ANTHROPIC_BASE_URL` is `http://127.0.0.1:4141/claude`.
 - **Codex says stream disconnected before completion:** confirm the proxy is running and Codex is pointed at `http://127.0.0.1:4141/codex/v1`, not the Claude base URL `http://127.0.0.1:4141/claude`.
 - **Codex CLI `/model` only shows bundled models:** compare the printed CLI provider with your selected profile and command-auth setup. `codex-config.ps1 -Write` manages and replaces the sections described above; do not run it blindly over a customized profile or use it to repair the app.
 - **Codex CLI missing auth:** confirm the selected provider has the matching `[model_providers.<id>.auth]` table. Distinguish local auth-helper failures from an upstream Copilot 401.
 - **Codex errors with `--profile copilot cannot be used while ... contains legacy profile = "copilot" or [profiles.copilot] config`:** Codex 0.134+ moved profiles into their own file. Re-run `pwsh scripts\codex-config.ps1 -Write` (it removes the legacy `[profiles.copilot*]` tables from `config.toml` and writes the profile to `~/.codex/copilot.config.toml`). To migrate by hand, move the keys under `[profiles.copilot]` into `~/.codex/copilot.config.toml` as top-level keys (drop the `profiles.copilot` prefix) and delete the legacy tables.
-- **Codex model not supported:** query `/codex/v1/models` and select a model present in both catalogs. The CLI helper defaults to `gpt-5.6-sol`; the app helper defaults to the pilot's `gpt-6-astra`. Neither default guarantees account access.
+- **Codex model not supported:** query `/codex/v1/models` and select a model present in both catalogs. The CLI helper defaults to `gpt-5.6-sol`; the app helper defaults to `gpt-6-astra`. Neither default guarantees account access.
 - **Codex model discovery:** `/codex/v1/models` includes both OpenAI-compatible `data` and Codex-compatible `models` fields.
 - **ChatGPT app ignores the relay:** select Codex and a local chat, inspect configuration precedence and any `model_catalog_json` override, then follow the [app troubleshooting guide](docs/codex-desktop.md#troubleshooting). Do not change ChatGPT Chat/Work settings or relax app permissions to force a connection.
-- **Docker says healthy but Codex fails:** the Compose healthcheck only checks the Claude health endpoint's HTTP status. Run `codex-desktop.ps1 -Check` for app prerequisites, then verify an actual local Codex request.
+- **Docker says healthy but Codex fails:** the Compose healthcheck only checks local `/livez`. Check `/codex/readyz?model=<exact-model-id>` and run `codex-desktop.ps1 -Check`, then verify an actual local Codex request.
 
 ### When a new or changed model breaks Claude
 
@@ -468,14 +490,15 @@ Upstream model availability and request schemas change without notice. Reasoning
    curl.exe -s -H "content-type: application/json" -d $b http://127.0.0.1:4141/claude/v1/messages
    ```
    Add the field you suspect (`reasoning_effort`, `output_config`, `thinking`) and compare. The upstream message usually tells you the new shape ("Use thinking.type.adaptive and output_config.effort").
-2. **Check advertised capabilities** for the model (effort values, context, endpoints):
+2. **Check selectable model IDs** through the relay without extracting credentials:
    ```powershell
-   $tok = (Select-String -Path .env -Pattern "COPILOT_GITHUB_TOKEN=(.+)").Matches[0].Groups[1].Value.Trim()
-   curl.exe -s -H "Authorization: Bearer $tok" -H "Copilot-Integration-Id: copilot-developer-cli" `
-     https://api.githubcopilot.com/models | ConvertFrom-Json | % data | ? vendor -eq Anthropic |
-     % { "{0,-32} effort=[{1}]" -f $_.id, ($_.capabilities.supports.reasoning_effort -join ",") }
+   $catalog = Invoke-RestMethod -Uri 'http://127.0.0.1:4141/claude/v1/models' -NoProxy -MaximumRedirection 0 -TimeoutSec 15
+   $catalog.data | Select-Object id, display_name
    ```
-   Note that `/models` can advertise a capability the `/v1/messages` endpoint no longer accepts in the old place — trust the live `/v1/messages` error over the catalog.
+   The Claude picker catalog contains IDs and names, not effort or context limits.
+   The relay retrieves effort metadata internally. If a deeper upstream check is
+   needed, use a separately approved diagnostic that keeps credentials inside the
+   relay; do not put an OAuth bearer on a host process command line.
 3. **Fix in the right spot** (almost always one of these, not the handler):
    - Reasoning-effort *values* per model → nothing to do; the live cache adapts.
    - A model-specific routing change → add a narrowly scoped rewrite helper only after live `/v1/messages` testing proves it is required.
@@ -485,70 +508,65 @@ Upstream model availability and request schemas change without notice. Reasoning
 
 ## Development
 
-**The Python relay and its tests run in Docker.** There is no host-side Python environment or package workflow. Windows client-configuration helpers use the already-installed PowerShell 7; their tests require no extra modules.
+**Python development and tests run in the Docker development target, not the
+production image or a host Python environment.** The default test suite does not
+load `.env` or make real inference requests. Live qualification harnesses are
+separate and explicitly opt-in. The PowerShell 7 test suite uses synthetic
+processes and temporary loopback listeners; it needs no installed test framework.
 
 ```powershell
-# Run the proxy (Docker)
-docker compose up -d --build proxy
+# Build the test environment from pinned base images and the lockfile.
+docker build --target development -t copilot-cli-relay:dev-hardening .
 
-# Tail logs
-docker compose logs -f proxy
+# Offline lint, Python tests/coverage, docs and PowerShell tests; no .env mount.
+pwsh scripts\test.ps1
 
-# Restart to pick up source edits (src/ and tests/ are bind-mounted read-only)
-docker compose restart proxy
+# Validate deployment configuration without reading credentials.
+pwsh scripts\check-compose.ps1
 
-# Stop
-docker compose down
+# Build and test an immutable production candidate. Does not deploy it.
+# A unique tag avoids changing the next production recreation before validation.
+$candidate = 'copilot-cli-relay:candidate-' + [guid]::NewGuid().ToString('N')
+docker build --target production -t $candidate .
+pwsh scripts\test-image.ps1 -Image $candidate
+pwsh scripts\test-stream-shutdown.ps1 -Image $candidate
 
-# Run unit tests
-docker compose run --rm proxy uv run pytest tests/unit -q
-
-# Lint
-docker compose run --rm proxy uv run ruff check src tests
-
-# Run a single test file or test
-docker compose run --rm proxy uv run pytest tests/unit/test_claude_proxy.py -q
-docker compose run --rm proxy uv run pytest tests/unit/test_claude_proxy.py::test_models_filters_and_canonicalizes -q
-
-# Coverage report
-docker compose run --rm proxy sh -lc "uv run coverage run --source=copilot_cli_relay -m pytest tests/unit -q && uv run coverage report --show-missing"
-
-# Open a shell inside the running container
-docker compose exec proxy bash
-
-# Codex route smoke checks
-curl http://127.0.0.1:4141/codex/healthz
-curl http://127.0.0.1:4141/codex/v1/models
-
-# ChatGPT app / Codex helper tests (existing host PowerShell, no network or installs)
-pwsh tests\powershell\test-codex-desktop.ps1
+# Optional, separately started development stack on port 4142, not production 4141.
+docker compose -f docker-compose.dev.yml up -d --build proxy
+docker compose -f docker-compose.dev.yml restart proxy
+docker compose -f docker-compose.dev.yml down
 ```
 
-The verified baseline is 478 Python tests, 99% package coverage, and 38
-PowerShell assertions. PowerShell assertions are separate from the Python test
-badge. Automated transport tests do not replace the version-scoped
-[app qualification](docs/codex-desktop.md#recorded-validation).
+See [production operations](docs/operations.md) for resource limits, liveness,
+readiness, image-based upgrade/rollback, and safe diagnostics. Only promote a
+validated candidate to the deployment selection after approval and preserving
+the previous artifact under a rollback tag. The
+[compatibility matrix and release checklist](docs/compatibility.md) distinguish
+synthetic tests from live client qualification. CI runs offline tests, lint,
+coverage, documentation/configuration checks, Windows helper tests, and a
+production image smoke test. It does not publish images or releases.
 
 ### Adding or upgrading a dependency
 
-The lockfile (`uv.lock`) is committed and the Dockerfile uses `uv sync --frozen`.
-Regenerate the lockfile when changing dependency requirements in `pyproject.toml`.
-Resolve and validate dependencies in disposable containers, not on the host.
+Edit `pyproject.toml` and regenerate `uv.lock` in the existing development image.
+Mount only dependency manifests, not the credential-bearing project directory.
+Resolve the installed image to an ID first, then rebuild and run all checks:
+
+Builds and tests run `uv lock --check --offline` to detect manifest/lock drift.
+`--frozen` alone does not check that consistency. The test runner additionally
+checks locked installed dependencies without installing anything; the editable
+project is intentionally excluded because source is mounted from this checkout.
 
 ```powershell
-# 1. Edit pyproject.toml (add/remove/bump a package).
-
-# 2. Regenerate the lockfile in a throwaway container that mounts the repo.
-docker run --rm -v "${PWD}:/work" -w /work --user root copilot-cli-relay:dev uv lock
-
-# 3. Rebuild the proxy image with the new lockfile.
-docker compose build proxy
-
-# 4. Run the tests to confirm nothing broke.
-docker compose run --rm proxy uv run pytest tests/unit -q
+$image = docker image inspect copilot-cli-relay:dev-hardening --format '{{.Id}}'
+if ($LASTEXITCODE -ne 0) { throw 'Build the development image first.' }
+docker run --rm --mount "type=bind,source=${PWD}/pyproject.toml,target=/app/pyproject.toml,readonly" --mount "type=bind,source=${PWD}/uv.lock,target=/app/uv.lock" $image uv lock
+docker build --target development -t copilot-cli-relay:dev-hardening .
+pwsh scripts\test.ps1
 ```
 
-If you don't yet have the `copilot-cli-relay:dev` image locally, replace step 2 with the standalone uv image: `docker run --rm -v "${PWD}:/work" -w /work ghcr.io/astral-sh/uv:python3.14-bookworm-slim uv lock`.
+Do not use the production image to install packages or run tests. Host/global
+tool changes and deployment restarts require separate approval.
 
 ## Security notes
 

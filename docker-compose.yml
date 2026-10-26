@@ -2,8 +2,10 @@ name: copilot-cli-relay
 
 services:
   proxy:
-    build: .
-    image: copilot-cli-relay:dev
+    build:
+      context: .
+      target: production
+    image: ${RELAY_IMAGE:-copilot-cli-relay:0.6.0}
     container_name: copilot-cli-relay
     env_file:
       - .env
@@ -12,22 +14,30 @@ services:
       # so the Docker publish can reach it; the host-side bind keeps it off the network.
       - "127.0.0.1:4141:4141"
     healthcheck:
-      # HTTP liveness only: /claude/healthz also probes upstream, but returns
-      # HTTP 200 even when upstream_ok=false. Inspect the JSON or use the
-      # route helpers for upstream/model readiness; this is not an inference test.
+      # Cheap local liveness only. Per-protocol readiness lives at /codex/readyz
+      # and /claude/readyz; neither readiness nor liveness is an inference test.
       # Python is already in the image, so no curl/wget installation is needed.
       # Compose does not restart unhealthy/stuck containers automatically;
       # restart: unless-stopped applies when the container exits.
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4141/claude/healthz', timeout=3).status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4141/livez', timeout=3).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
-    volumes:
-      # Read-only source mount for fast iteration. Restart container to pick up changes:
-      #   docker compose restart proxy
-      - ./src:/app/src:ro
-      - ./tests:/app/tests:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    cpus: 2
+    pids_limit: 128
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # `unless-stopped` so the proxy survives Docker Desktop / host reboots
     # without manual `docker compose up`. `docker compose down` and Ctrl-C
     # still stop it cleanly. Crashes are visible in `docker compose logs`.

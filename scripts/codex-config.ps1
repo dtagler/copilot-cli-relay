@@ -32,6 +32,8 @@ $providerSnippet = @'
 name = "GitHub Copilot via local relay"
 base_url = "http://127.0.0.1:4141/codex/v1"
 wire_api = "responses"
+# Use harness-managed /compact, not the standalone /responses/compact endpoint.
+capabilities.remote_compaction = "unsupported"
 requires_openai_auth = false
 request_max_retries = 4
 stream_max_retries = 10
@@ -71,29 +73,80 @@ if (-not $Write) {
 function Remove-TomlTableTree {
   param(
     [Parameter(Mandatory)]
+    [AllowEmptyString()]
     [string]$Text,
 
     [Parameter(Mandatory)]
     [string]$TableName
   )
 
-  $escaped = [regex]::Escape($TableName)
-  $pattern = "(?ms)^\[$escaped(?:\.[^\]]+)?\]\r?\n.*?(?=^\[|\z)"
-  return [regex]::Replace($Text, $pattern, '')
+  # This is a deliberately limited editor, not a TOML parser. Refuse layouts
+  # that can hide headers inside strings or define the provider inline instead
+  # of guessing and risking unrelated configuration.
+  if ($Text.Contains('"""') -or $Text.Contains("'''")) {
+    throw 'Automatic CLI merge does not support multiline TOML strings. Use print-only mode and merge manually.'
+  }
+  $key = '(?:[A-Za-z0-9_-]+|"(?:[^"\\\r\n]|\\.)*"|''[^''\r\n]*'')'
+  $headerPattern = '^[ \t]*\[(?<array>\[)?[ \t]*(?<path>' + $key + '(?:[ \t]*\.[ \t]*' + $key + ')*)[ \t]*\](?(array)\])[ \t]*(?:#[^\r\n]*)?\r?$'
+  $headers = [regex]::Matches($Text, '(?m)^[ \t]*\[.*$')
+  $target = $TableName.Split('.')
+  $remove = [Collections.Generic.List[object]]::new()
+  for ($index = 0; $index -lt $headers.Count; $index++) {
+    $header = $headers[$index]
+    $parsed = [regex]::Match($header.Value, $headerPattern)
+    if (-not $parsed.Success) {
+      throw 'Unsupported TOML table syntax; no configuration was written. Use print-only mode.'
+    }
+    $parts = @([regex]::Matches($parsed.Groups['path'].Value, $key) | ForEach-Object {
+      $value = $_.Value
+      if ($value.StartsWith('"') -or $value.StartsWith("'")) { $value.Substring(1, $value.Length - 2) } else { $value }
+    })
+    if ($parts[0].Contains('\') -or
+        ($parts[0] -in @('model_providers','profiles') -and $parts.Count -gt 1 -and $parts[1].Contains('\'))) {
+      throw 'Escaped managed TOML table names require a manual merge.'
+    }
+    if ($parts.Count -eq 1 -and $parts[0] -eq $target[0]) {
+      throw 'Inline managed TOML tables require a manual merge.'
+    }
+    $match = $parts.Count -ge $target.Count
+    for ($part = 0; $match -and $part -lt $target.Count; $part++) {
+      $match = $parts[$part] -ceq $target[$part]
+    }
+    if ($match) {
+      if ($parsed.Groups['array'].Success) { throw 'Managed array tables require a manual merge.' }
+      $end = if ($index + 1 -lt $headers.Count) { $headers[$index + 1].Index } else { $Text.Length }
+      $remove.Add(@($header.Index, ($end - $header.Index)))
+    }
+  }
+  $rootEnd = if ($headers.Count) { $headers[0].Index } else { $Text.Length }
+  $root = $Text.Substring(0, $rootEnd)
+  $rootKeyPattern = '(?m)^[ \t]*' + $key + '[ \t]*(?:\.|=)'
+  foreach ($assignment in [regex]::Matches($root, $rootKeyPattern)) {
+    $firstKey = [regex]::Match($assignment.Value.TrimStart(), $key).Value.Trim('"', "'")
+    if ($firstKey -eq $target[0] -or $firstKey.Contains('\')) {
+      throw 'Dotted or inline root provider/profile keys require a manual merge.'
+    }
+  }
+  for ($index = $remove.Count - 1; $index -ge 0; $index--) {
+    $Text = $Text.Remove($remove[$index][0], $remove[$index][1])
+  }
+  return $Text
 }
 
 function Remove-LegacyProfileTables {
   param(
     [Parameter(Mandatory)]
+    [AllowEmptyString()]
     [string]$Text
   )
 
-  # Strip [profiles.copilot] and any subtable ([profiles.copilot.windows], etc.).
-  $pattern = "(?ms)^\[profiles\.copilot(?:\.[^\]]+)?\]\r?\n.*?(?=^\[|\z)"
-  $stripped = [regex]::Replace($Text, $pattern, '')
-  # Strip a top-level `profile = "copilot"` selector line (no longer supported).
-  $stripped = [regex]::Replace($stripped, '(?m)^\s*profile\s*=\s*"copilot"\s*\r?\n', '')
-  return $stripped
+  $stripped = Remove-TomlTableTree -Text $Text -TableName 'profiles.copilot'
+  # Remove only a ROOT selector, never an unrelated table's profile field.
+  $firstTable = [regex]::Match($stripped, '(?m)^[ \t]*\[')
+  $rootEnd = if ($firstTable.Success) { $firstTable.Index } else { $stripped.Length }
+  $root = [regex]::Replace($stripped.Substring(0, $rootEnd),
+    '(?m)^[ \t]*profile[ \t]*=[ \t]*(?:"copilot"|''copilot'')[ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z)', '')
+  return $root + $stripped.Substring($rootEnd)
 }
 
 $codexDir = Join-Path $env:USERPROFILE '.codex'
@@ -101,7 +154,7 @@ $configPath = Join-Path $codexDir 'config.toml'
 $profilePath = Join-Path $codexDir 'copilot.config.toml'
 $existing = ''
 if (Test-Path $configPath) {
-  $existing = Get-Content -Raw -Path $configPath
+  $existing = [string](Get-Content -Raw -Path $configPath)
 }
 
 Write-Host "About to update Codex relay setup:" -ForegroundColor Cyan
