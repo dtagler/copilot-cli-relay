@@ -125,6 +125,53 @@ trusted-host overrides, disabled verification, or an arbitrary mirror.
 The current cache-built production image remains operational. Its successful
 build and tests do not substitute for a clean-download result.
 
+## Release preparation follow-up
+
+The first hosted workflow on commit `2407760` completed on October 26, 2026.
+Its Windows helper job and Linux development dependency build, Python suite,
+lint, coverage, and documentation checks passed. The Linux Compose check failed
+because that runner required the referenced `.env` file even though the command
+used `--no-env-resolution`; production image build/smoke/shutdown steps did not
+run. This is a validation portability defect, not a need to upload credentials.
+
+The validator now works in a temporary copy of the Compose files with an empty
+synthetic `.env`. Regression tests cover absent and existing source env files,
+both native-command failure positions, safety-check failure, scratch cleanup,
+and working-directory restoration. A successful hosted rerun is still required
+before publishing the release.
+
+The same preparation retried a local no-cache production build. Locked wheel
+downloads again failed with `HandshakeFailure` from `files.pythonhosted.org`.
+The successful hosted development build does not resolve this local ARM64
+network/download limitation. TLS verification and dependency sources were not
+changed.
+
+An offline cache-backed local rebuild then succeeded:
+
+- Candidate tag: `copilot-cli-relay:release-0.6.0-2407760`.
+- Image ID:
+  `sha256:d3c1870e64bfd762ee1e020ea83ed0e6569f0c849da2efd0c6db45afd89e1b1d`.
+- Dependency cache source: retained development image
+  `sha256:b2933d6fcf436c20cf13a4ecb048b928a748fb346e82672c582eee8ef7df68ce`,
+  with its local tag verified before use.
+- A build-only Dockerfile supplied on stdin added that cache stage, copied its
+  `/root/.cache/uv` into the builder, and set `UV_OFFLINE=1` there. Build RUN
+  steps used `--network none`. The committed Dockerfile, dependency lock,
+  pinned base images, runtime source, and production stage were unchanged.
+- All 14 installed runtime module hashes match current source. Non-root
+  runtime-only smoke, idle shutdown, active-stream draining, and the rollback
+  adapter test passed in isolated containers with synthetic credentials.
+- Full local checks passed: 689 Python tests, 99% package coverage, 168
+  PowerShell assertions including 38 Compose regression assertions, lint,
+  lock/environment checks, generated TOML, syntax, and documentation checks.
+
+This is a rebuilt candidate, not a clean remote restore or a deployment. The
+production container and default image tag still identify the reviewed
+`sha256:a188da1f...` artifact recorded in the deployment report. The candidate
+does not contain the dependency cache or development tooling. No inference,
+live restart, image publication, or GitHub release was performed during this
+preparation. Publication awaits the reviewed fix commit and successful hosted CI.
+
 ## User-assisted GUI acceptance
 
 On October 26, 2026, the user confirmed completing all five checks below and

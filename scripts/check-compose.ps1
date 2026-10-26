@@ -1,8 +1,21 @@
 #requires -Version 7
-# Read-only: never resolve the credential-bearing env_file or create containers.
+param([string]$ProjectRoot = (Split-Path $PSScriptRoot))
+# Never read the real .env or create containers. Some Compose versions still
+# require env_file to exist with --no-env-resolution, so use a disposable copy.
 $ErrorActionPreference = 'Stop'
-Push-Location (Split-Path $PSScriptRoot)
+$scratch = Join-Path ([IO.Path]::GetTempPath()) ('relay-compose-check-' + [guid]::NewGuid().ToString('N'))
+$ownedFiles = @('.gitignore', '.env', '.env.example', 'docker-compose.yml', 'docker-compose.dev.yml')
+$pushed = $false
+if (Test-Path -LiteralPath $scratch) { throw 'Validation directory unexpectedly exists.' }
+$null = New-Item -ItemType Directory -Path $scratch
 try {
+    Set-Content -LiteralPath (Join-Path $scratch '.gitignore') -Value '.env'
+    Set-Content -LiteralPath (Join-Path $scratch '.env') -Value '' -NoNewline
+    foreach ($name in @('.env.example', 'docker-compose.yml', 'docker-compose.dev.yml')) {
+        Copy-Item -LiteralPath (Join-Path $ProjectRoot $name) -Destination (Join-Path $scratch $name)
+    }
+    Push-Location $scratch
+    $pushed = $true
     $raw = docker compose --env-file .env.example -f docker-compose.yml config --no-env-resolution --format json
     if ($LASTEXITCODE -ne 0) { throw 'Production Compose validation failed.' }
     $config = ($raw -join "`n") | ConvertFrom-Json
@@ -30,4 +43,26 @@ try {
         throw 'Development scratch mount must be one bounded tmpfs specification.'
     }
     Write-Output 'Production and development Compose safety checks passed.'
-} finally { Pop-Location }
+} finally {
+    if ($pushed) { Pop-Location }
+    # Only remove our explicitly named files, never recurse through a directory.
+    # Refuse cleanup if a link or an unexpected directory has replaced the root.
+    $item = Get-Item -LiteralPath $scratch -Force
+    if (-not $item.PSIsContainer -or
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        $item.FullName -ne [IO.Path]::GetFullPath($scratch)) {
+        throw 'Refusing cleanup of an unexpected validation directory.'
+    }
+    foreach ($name in $ownedFiles) {
+        $path = Join-Path $scratch $name
+        if (Test-Path -LiteralPath $path) {
+            $file = Get-Item -LiteralPath $path -Force
+            if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw 'Refusing cleanup of an unexpected validation file.'
+            }
+            Remove-Item -LiteralPath $path -Force
+        }
+    }
+    # An unexpected extra file prevents removal rather than broadening cleanup.
+    [IO.Directory]::Delete($scratch, $false)
+}

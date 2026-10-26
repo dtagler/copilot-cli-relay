@@ -194,6 +194,14 @@ read-only and does not deploy, publish, or run paid inference. Repository branch
 protection and required-review settings are not enabled by adding a workflow;
 configure those separately with explicit authorization.
 
+`scripts/check-compose.ps1` copies only the two Compose files and `.env.example`
+to a task-owned temporary directory and creates an empty synthetic `.env` there.
+Some Compose versions require `env_file` to exist even with
+`--no-env-resolution`. The validator never copies or reads the real `.env`,
+never starts containers, and removes only its own known scratch files.
+Missing/unsafe Compose configuration and native command failures still fail
+the check; the synthetic file is not a production fallback.
+
 The deployment and six-request evidence from October 26, 2026 is recorded in
 [the deployment report](deployment-2026-10-26.md). Active-stream shutdown and
 legacy-image startup were rehearsed in network-isolated containers, not by
