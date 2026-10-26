@@ -33,9 +33,8 @@ identifier remain unchanged.
 | Codex CLI / ChatGPT app      |       | Codex route handlers                   |       | GitHub Copilot                 |
 | (Codex, local)               |       |                                        |       |                                |
 | OpenAI Responses JSON/SSE    |       | build_codex_outbound_headers           |       | Responses native endpoints     |
-| POST /codex/v1/responses     | ====> | compact fallback, body cleanup         | ====> | POST /responses                |
-| POST /codex/v1/responses/    | ====> |                                        | ====> | POST /responses/compact        |
-| compact                      |       |                                        |       | or fallback to /responses      |
+| POST /codex/v1/responses     | ====> | request cleanup, bounded streaming     | ====> | POST /responses                |
+| /compact: harness-managed   |       | same Responses route, no app patch     |       | ordinary model requests        |
 | GET  /codex/v1/models        | <==== |                                        | <==== | GET  /models                   |
 +==============================+       +====================^===================+       +================================+
                                                             |
@@ -54,6 +53,9 @@ Four things make this work cleanly:
 The ChatGPT app's bundled Codex engine owns the conversation, full-history
 replay, and local tool execution. The relay forwards model requests and results;
 it neither runs those tools nor hosts the app's conversation state.
+The legacy standalone compact API is deliberately excluded from this client
+diagram. It remains an explicit-caller route, described below, with synthetic
+fallback disabled by default.
 
 ---
 
@@ -78,7 +80,8 @@ and one `ModelCapabilityCache`. Shutdown closes the capability cache and its
 refresh task before closing the HTTP client. There is no separate app server,
 desktop-only inference endpoint, or WebSocket route.
 
-Health endpoints return HTTP 200 even when `upstream_ok` is false. Read
+Legacy `/healthz`, `/claude/healthz`, and `/codex/healthz` can return HTTP 200
+even when `upstream_ok` is false. Read
 `upstream_ok`, `upstream_status`, and the route's model count to assess upstream
 health. The Compose healthcheck tests local `/livez` without upstream access;
 its `healthy` label is not a Codex readiness or inference result.
@@ -120,7 +123,7 @@ scripts/
 |-- check-desktop-catalog.ps1 # Isolated bundled-engine metadata qualification
 |-- proxy.ps1             # Fail-fast container lifecycle and route checks
 |-- test.ps1              # Offline dependencies/lint/test/coverage/docs checks
-|-- check-compose.ps1     # Deployment contract checks without .env resolution
+|-- check-compose.ps1     # Isolated production/dev/optional rollback validation
 |-- check-docs.py         # Offline links/examples and package-version checks
 |-- test-image.ps1        # Runtime-only production smoke test
 |-- test-stream-shutdown.ps1 # Synchronized active stream drain rehearsal
@@ -129,7 +132,7 @@ scripts/
 `-- qualify-checkpoint.py # Opt-in native checkpoint/continuation probe
 
 tests/unit/              # Python relay tests, including stream lifetimes
-tests/powershell/        # Dependency-free Windows app-helper tests
+tests/powershell/        # Dependency-free config/lifecycle/Compose/helper tests
 tests/integration/       # Network-isolated operational rehearsal fixtures
 tests/fixtures/          # Non-sensitive manual acceptance fixture
 docs/codex-desktop.md    # App configuration, evidence, and compatibility limits
@@ -144,10 +147,10 @@ is Claude-specific; it does not configure Codex in either client.
 
 ## Request lifecycle: `POST /claude/v1/messages`
 
-1. **Read body once.** `_parse_claude_request(raw_body, caps)` performs a single `json.loads` and returns `(rewritten_body, model, streaming)`. Malformed bodies pass through unchanged so the client sees Copilot's actual error message.
+1. **Bound the upload, then parse once.** Host/browser guards run before the admission middleware, which buffers the upload within its size and time limits. The handler reads that buffered body; `_parse_claude_request(raw_body, caps)` performs one JSON parse and returns `(rewritten_body, model, streaming)`. Malformed JSON within those limits passes upstream; local guard, size, and timeout failures do not.
 2. **Rewrite the body for Copilot.** Two massaging steps run before forwarding:
    - `_apply_thinking_rewrite` converts `thinking: {type: "enabled", budget_tokens: N}` (the legacy extended-thinking shape Claude Code sends) into `thinking: {type: "adaptive"}` and drops `budget_tokens`. Copilot's Anthropic endpoint now rejects `thinking.type.enabled` outright ("Use thinking.type.adaptive and output_config.effort") and rejects `budget_tokens` under adaptive. Other thinking types (`disabled`, already-`adaptive`) pass through.
-   - `_apply_effort_rewrite` first **relocates** any top-level `reasoning_effort` into `output_config.effort` — Copilot no longer accepts the top-level field at all ("Extra inputs are not permitted"); `output_config.effort` is the live control surface (an existing `output_config.effort` wins if both are present). It then clamps that value to the set each model accepts. The allowed set is resolved by `_resolve_allowed_efforts` with this precedence: **live upstream `/models` capabilities** (`capabilities.supports.reasoning_effort`, cached by `ModelCapabilityCache` in `model_capabilities.py`) → the static `_EFFORT_OVERRIDES` fallback (used only when `/models` is unreachable) → the default `{low, medium, high}`. Policy details:
+   - `_apply_effort_rewrite` first relocates top-level `reasoning_effort` into `output_config.effort`, preserving an existing nested value. This handles the observed upstream rejection of the top-level field. `_resolve_allowed_efforts` prefers a live per-model entry from `ModelCapabilityCache`; if that model has no entry, it uses `_EFFORT_OVERRIDES` and then the default `{low, medium, high}`. Static fallback can therefore apply even when the catalog is reachable. Policy details:
    - Advertised effort sets take precedence over static fallback entries.
    - A model that explicitly advertises no reasoning effort has the field removed.
    - A non-string top-level `reasoning_effort` (can't become an `output_config.effort` string) is dropped rather than forwarded into a guaranteed 400; empty `output_config` after stripping is dropped entirely.
@@ -159,7 +162,7 @@ is Claude-specific; it does not configure Codex in either client.
    - Filters `anthropic-beta` through `_filter_anthropic_beta`, removing the `UNSUPPORTED_BETA_TOKENS` case-insensitively. The current set is `context-1m-2025-08-07` and `advisor-tool-2026-03-01`.
    - Sets `Authorization: Bearer <COPILOT_GITHUB_TOKEN>`, `Copilot-Integration-Id`, `Editor-Version`, `User-Agent`, `X-Request-Id`, and (case-insensitive defaulted) `anthropic-version`.
 4. **Dispatch by streaming flag.**
-   - **Non-streaming (`stream: false`):** `client.send(req, stream=True)` lets the proxy inspect status before buffering. For `2xx`, the full body is read and passed through with hop-by-hop headers stripped. For `>=400`, the upstream error body is read with the 32 KiB cap and returned as an Anthropic error envelope.
+   - **Non-streaming (`stream: false`):** `client.send(req, stream=True)` lets the proxy inspect status before buffering. Successful bodies are decoded and read within `COPILOT_MAX_RESPONSE_BYTES`, then forwarded with filtered headers and corrected content length. For `>=400`, diagnostic reads use a separate 32 KiB cap and an Anthropic error envelope.
    - **Streaming (`stream: true`):** `_stream_response()` opens upstream with `client.send(req, stream=True)`, checks status before committing to `StreamingResponse`, then yields SSE chunks through `chunks_with_keepalive()`. See next section.
 5. **Errors.** `httpx.TimeoutException` and `httpx.HTTPError` are caught and converted to Anthropic-shaped envelopes (`anthropic_json_error` for non-stream, `anthropic_sse_error_event` mid-stream).
 
@@ -212,12 +215,12 @@ If the client disconnects:
 Key invariants:
 
 - **Ping timeout cancels `recv.receive()`, NOT the upstream HTTP read.** The upstream read keeps running in the background producer; cancelling a memory-channel read is harmless.
-- **Frame-safe heartbeats.** Constant-size parser state tracks complete SSE events without accumulating their payloads. A pause inside a partial field/event, including an ambiguous CRLF split, deliberately gets no heartbeat. Upstream chunks are not rewritten.
+- **Frame-safe heartbeats.** Constant-size parser state tracks complete SSE events without accumulating their payloads. A pause inside a partial field/event, including an ambiguous CRLF split, deliberately gets no heartbeat. Native event payloads are not rewritten; transport decoding and chunk boundaries need not match upstream wire bytes.
 - **Producer exceptions are captured, not swallowed.** They are stashed in a `producer_error` list and re-raised after producer cleanup, without exception-group wrapping. The route-specific `body_iter` emits the protocol's terminal error frame; a truncated event cannot be repaired retroactively.
 - **Ping handling is route-specific.** `chunks_with_keepalive` yields a `"ping"` sentinel. Claude converts it to `event: ping`; Codex converts it to a `: keepalive` comment so each client keeps its native SSE shape.
 - **Client disconnect short-circuits cleanly.** The consumer cancels and joins its producer before yielding a terminal disconnect sentinel. Iterator and upstream-response closure are protected by explicit ownership and cancellation-shielded cleanup.
 - **Channel buffer = 8** applies backpressure to slow clients; the decoder yields at most 64 KiB per queued chunk.
-- **Decoding:** `decoded_chunks()` uses raw wire bytes and bounded decoding. Outbound headers explicitly negotiate `gzip, identity`, overriding client preferences. Single gzip and zlib-wrapped deflate can be decoded; unsupported encodings or chains fail as protocol errors. Never restore HTTPX's unbounded decoder.
+- **Decoding:** `decoded_chunks()` uses raw wire bytes and bounded decoding. Outbound headers explicitly negotiate `gzip, identity`, overriding client preferences. Gzip, including concatenated members, and zlib-wrapped deflate can be decoded; unsupported encodings or encoding chains fail as protocol errors. Never restore HTTPX's unbounded decoder.
 - **Pre-stream errors return real HTTP status.** `_stream_response` and `_codex_stream_response` open upstream with `client.send(req, stream=True)` and inspect `upstream.status_code` *before* returning a `StreamingResponse`. If upstream answered >=400 before any body byte was forwarded, the proxy returns a `JSONResponse` with the upstream status (`401`, `429`, ...) and the route's error envelope. Only failures observed *after* the stream has started surface as terminal SSE error frames. This lets SDK retry logic that keys on HTTP status (`401` -> re-auth, `429` -> backoff) fire correctly. The bounded-read helper (`read_bounded`, 32 KiB cap) prevents a hostile or runaway upstream error body from being read into memory unbounded.
 
 ### Stream ownership and cancellation
@@ -290,7 +293,11 @@ CLI/app setup selects harness-managed compaction with
 `capabilities.remote_compaction = "unsupported"` in each Copilot provider.
 Users invoke `/compact`; the harness manages its summary/history using ordinary
 Responses requests rather than the standalone compact API. This is distinct
-from the relay's synthetic fallback. See [compaction](docs/compaction.md).
+from the relay's synthetic fallback. "Local" compaction is harness-managed, not
+offline inference; this capability setting does not disable automatic
+context-limit triggering. User-confirmed manual completion in both clients
+does not establish automatic triggering or post-compaction tool continuity.
+See [compaction](docs/compaction.md).
 
 For explicit legacy API callers, `POST /codex/v1/responses/compact` first tries the native upstream compact
 endpoint. On 404 only and with `COPILOT_ENABLE_SYNTHETIC_COMPACTION=1`, it appends a summary prompt, calls ordinary `/responses`
@@ -376,6 +383,16 @@ reopening. That user report is separate from independently observed tests.
 See the [qualification record](docs/codex-desktop.md#recorded-validation)
 before claiming another model, app build, OS, Worktree mode, or cloud feature
 is supported.
+
+The October 26 duplicate-output investigation found one persisted answer and a
+matching completion ID in inspected desktop turns despite two displayed text
+blocks. The CLI workflow was unaffected. This is a presumed desktop compatibility
+issue, not proven upstream or relay innocence: persisted records do not capture
+every live event or rendering transition. The relay does not reconcile message
+IDs, deduplicate text, or replay failed inference requests on its own. Preserve
+native events, and use allowlisted, pseudonymized metadata across boundaries
+rather than body logging or speculative event suppression.
+See the [known-issue record](docs/codex-desktop.md#known-issue-duplicate-desktop-output).
 
 The [official app settings](https://learn.chatgpt.com/docs/developer-settings)
 and [gateway configuration](https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway)
@@ -536,6 +553,51 @@ the limit, or unknown secret formats. Do not share diagnostics automatically.
 
 ---
 
+## Operational and validation boundaries
+
+The October 26, 2026 release work established the following maintenance rules:
+
+| Boundary | Contract and lesson |
+|---|---|
+| Source, image, container | Git commits and releases do not replace installed wheels. A rebuild creates an artifact; tag changes select artifacts for later recreation; restart runs the same existing container. Compare installed module hashes and locked package versions, not just `0.6.0` labels. |
+| Configuration | Compose injects `.env` at container creation. Restart cannot reload it. A client provider change needs a client reload, not a relay rebuild. |
+| Health, readiness, inference | `/livez` is local. Readiness validates selectable catalogs without inference. Neither establishes GUI rendering or tool/history behavior. Manual `/compact` is another distinct acceptance result. |
+| Build portability | A successful hosted Linux build is not a clean local ARM64 restore. The local package-host TLS failure persisted while an approved offline cache-backed rebuild passed. Keep TLS verification and locked sources intact. |
+| Image retention | Multiple tags may name one image. Removing a development image or rollback artifact eliminates that local capability, even if historical docs record its former ID. Rebuild deliberately rather than installing tools into production. |
+
+### Credential-free Compose validation
+
+The initial hosted workflow exposed two independent invocations that required
+`.env` to exist despite `--no-env-resolution`: the ordinary Compose check and
+the rollback check. Both now use `scripts/check-compose.ps1`. It copies only
+the public Compose files and `.env.example` into a task-owned temporary
+directory, creates an empty synthetic `.env` after its ignore rule, and validates
+there. It never reads the real `.env` or creates containers.
+
+Optional `-RollbackImage` requires an exact image ID and adds the rollback YAML
+to the same isolated check. The process-scoped selector is restored in `finally`,
+including true absence. Cleanup removes only named owned files, rejects replaced
+or linked paths, and does not recursively delete unexpected content.
+`test-rollback.ps1` runs this gate before its separate isolated image rehearsal.
+Do not make production `.env` optional or copy credentials to CI to solve a
+validation-only portability problem.
+
+### Release evidence
+
+The published `v0.6.0` tag targets `6c71885`. Final hosted
+[run 40386404641](https://github.com/dtagler/copilot-cli-relay/actions/runs/40386404641)
+passed both jobs, including Linux production build, smoke/idle shutdown,
+active-stream shutdown, and rollback checks. The local and hosted validation
+record includes 689 Python tests, 99% package coverage, 242 PowerShell assertions,
+and 81 local documentation links at release time. Later documentation edits can
+change the link count without changing runtime coverage.
+
+Dated preparation records retain earlier failures rather than retroactively
+claiming success. Use the final release run for release status and those records
+for provenance. GUI duplication, broader platform qualification, comprehensive
+vulnerability scanning, automatic compaction, and post-compaction continuity
+retain their separately documented limits.
+
 ## Testing
 
 Tests live in `tests/unit/` and run in the Docker **development** target.
@@ -556,6 +618,7 @@ See [production operations](docs/operations.md) and the
 separate real-client acceptance gates. Coverage is not blanket app compatibility.
 
 Coverage hot-spots that matter:
+- Compose validation - synthetic missing/existing `.env`, native failures, rollback image/health checks, process-selector restoration, location restoration, and scratch cleanup; no real credentials.
 - `chunks_with_keepalive` - both happy-path (chunks-after-pings regression) and producer-exception propagation are covered.
 - Inbound auth-leak - explicit test asserts `Authorization`, `x-api-key`, `proxy-authorization`, `Cookie` never reach upstream.
 - Body redaction - every pattern has a positive test.

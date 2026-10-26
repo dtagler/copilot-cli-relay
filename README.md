@@ -83,6 +83,16 @@ The [full-project review](docs/project-review-2026-10-26.md) records the later
 promotion/hardening regression fixes and the distinction between reviewed source
 and the deployed image.
 
+### Release validation: October 26, 2026
+
+Version **v0.6.0** was published from commit `6c71885`. The final
+[hosted workflow](https://github.com/dtagler/copilot-cli-relay/actions/runs/40386404641)
+passed both Windows helper tests and Linux build/test jobs, including production
+smoke, active-stream shutdown, and rollback validation. Recorded totals are
+689 Python tests, 99% package coverage, and 242 PowerShell assertions.
+Earlier failed runs in the dated preparation records were fixed before release.
+These are release-specific results, not proof of every client/platform combination.
+
 ## How it works
 
 ```text
@@ -99,9 +109,8 @@ and the deployed image.
 | Codex CLI / ChatGPT app      |       | Codex route handlers                   |       | GitHub Copilot                 |
 | (Codex, local)               |       |                                        |       |                                |
 | OpenAI Responses JSON/SSE    |       | build_codex_outbound_headers           |       | Responses native endpoints     |
-| POST /codex/v1/responses     | ====> | compact fallback, body cleanup         | ====> | POST /responses                |
-| POST /codex/v1/responses/    | ====> |                                        | ====> | POST /responses/compact        |
-| compact                      |       |                                        |       | or fallback to /responses      |
+| POST /codex/v1/responses     | ====> | request cleanup, bounded streaming     | ====> | POST /responses                |
+| /compact: harness-managed   |       | same Responses route, no app patch     |       | ordinary model requests        |
 | GET  /codex/v1/models        | <==== |                                        | <==== | GET  /models                   |
 +==============================+       +====================^===================+       +================================+
                                                             |
@@ -121,7 +130,7 @@ and the deployed image.
 | Auth | Reads `COPILOT_GITHUB_TOKEN` from the container environment. Compose loads it from `.env` when creating the container. |
 | Header safety | Strips local client auth, cookies, host, content length, and hop-by-hop headers. |
 | Protocol headers | Adds the Copilot bearer plus Claude-specific or Codex-specific headers. |
-| Compatibility | Applies small route-specific body rewrites, then streams the native upstream response format back unchanged. |
+| Compatibility | Applies route-specific request rewrites; forwards native SSE event payloads without protocol translation, with bounded decompression and boundary-safe keepalives. |
 
 The proxy keeps each client on its native protocol. Codex's CLI and app clients
 share `/codex/v1/responses`; there is no extra desktop route or app patch. The
@@ -149,8 +158,30 @@ not require a separate Codex CLI installation; the tested app bundles its engine
 # First-time setup: extract the Copilot OAuth token to the ignored .env file
 pwsh scripts\extract-token.ps1
 
-# Start the shared relay
-docker compose up -d --build proxy
+# First-time deployment only: build a separate candidate, then validate it.
+$candidate = 'copilot-cli-relay:candidate-' + [guid]::NewGuid().ToString('N')
+docker build --target production -t $candidate .
+if ($LASTEXITCODE -ne 0) { throw 'Production build failed; do not deploy.' }
+pwsh scripts\check-compose.ps1
+if ($LASTEXITCODE -ne 0) { throw 'Compose validation failed; do not deploy.' }
+pwsh scripts\test-image.ps1 -Image $candidate
+if ($LASTEXITCODE -ne 0) { throw 'Image validation failed; do not deploy.' }
+pwsh scripts\test-stream-shutdown.ps1 -Image $candidate
+if ($LASTEXITCODE -ne 0) { throw 'Shutdown validation failed; do not deploy.' }
+
+# After deployment approval; for upgrades, preserve rollback first.
+$previousSelection = [Environment]::GetEnvironmentVariable('RELAY_IMAGE', 'Process')
+try {
+    $env:RELAY_IMAGE = $candidate
+    docker compose up -d --no-build --pull never --wait proxy
+    if ($LASTEXITCODE -ne 0) { throw 'Deployment failed; inspect before retrying.' }
+} finally {
+    if ($null -eq $previousSelection) {
+        [Environment]::SetEnvironmentVariable('RELAY_IMAGE', [NullString]::Value, 'Process')
+    } else {
+        [Environment]::SetEnvironmentVariable('RELAY_IMAGE', $previousSelection, 'Process')
+    }
+}
 
 # Read-only health checks, bypassing any shell proxy configuration
 Invoke-RestMethod http://127.0.0.1:4141/claude/healthz -NoProxy
@@ -160,6 +191,10 @@ Invoke-RestMethod http://127.0.0.1:4141/codex/healthz -NoProxy
 Check `upstream_ok`, `upstream_status`, and the relevant model count, not just
 HTTP 200 or Docker's `healthy` label. These checks do not exercise inference.
 If the relay is already configured and healthy, skip token extraction and startup.
+Before any later `compose up`, deliberately persist the validated image selection
+using the [deployment procedure](docs/operations.md#image-selection-before-recreation).
+The temporary override above does not update the default image tag. If a build
+fails at package-host TLS, stop; do not disable certificate verification.
 
 ## Claude Setup
 
@@ -309,6 +344,12 @@ streamed stop/recovery, and reopening checks passed. These are user-reported,
 not independently observed GUI results; see the [acceptance record](docs/remaining-qualification.md#user-assisted-gui-acceptance).
 A passing `-Check` alone is not proof of those workflows or of inference.
 
+**Known desktop issue:** full assistant replies can appear twice in the GUI
+while the inspected transcript contains one answer. The reported CLI workflow
+was unaffected. Treat this as a presumed desktop compatibility issue, not a
+proven relay defect; do not add blind text deduplication or enable body logging.
+See the [evidence and limits](docs/codex-desktop.md#known-issue-duplicate-desktop-output).
+
 ## Lifecycle helper
 
 Interactive menu wrapping the common `docker compose` flows. Run it with no
@@ -333,6 +374,10 @@ copilot-cli-relay - pick an action:
 For scripted use, prefer the underlying `docker compose` commands directly.
 The `codex` menu action checks the shared CLI/app route, not the app's effective
 configuration or inference.
+The menu executes the selected action; it is not the release-validation pipeline.
+In particular, `rebuild` builds the selected tag and immediately recreates the
+container. For production upgrades, prefer the separate candidate validation and
+approval sequence in [operations](docs/operations.md#upgrade-and-rollback).
 
 | Changed input | Apply it with |
 |---|---|
@@ -517,19 +562,27 @@ processes and temporary loopback listeners; it needs no installed test framework
 ```powershell
 # Build the test environment from pinned base images and the lockfile.
 docker build --target development -t copilot-cli-relay:dev-hardening .
+if ($LASTEXITCODE -ne 0) { throw 'Development build failed.' }
 
 # Offline lint, Python tests/coverage, docs and PowerShell tests; no .env mount.
 pwsh scripts\test.ps1
+if ($LASTEXITCODE -ne 0) { throw 'Development validation failed.' }
 
 # Validate deployment configuration without reading credentials.
 pwsh scripts\check-compose.ps1
+if ($LASTEXITCODE -ne 0) { throw 'Compose validation failed.' }
 
 # Build and test an immutable production candidate. Does not deploy it.
 # A unique tag avoids changing the next production recreation before validation.
 $candidate = 'copilot-cli-relay:candidate-' + [guid]::NewGuid().ToString('N')
 docker build --target production -t $candidate .
+if ($LASTEXITCODE -ne 0) { throw 'Candidate build failed.' }
 pwsh scripts\test-image.ps1 -Image $candidate
+if ($LASTEXITCODE -ne 0) { throw 'Candidate smoke failed.' }
 pwsh scripts\test-stream-shutdown.ps1 -Image $candidate
+if ($LASTEXITCODE -ne 0) { throw 'Candidate shutdown failed.' }
+pwsh scripts\test-rollback.ps1 -Image $candidate
+if ($LASTEXITCODE -ne 0) { throw 'Rollback-adapter validation failed.' }
 
 # Optional, separately started development stack on port 4142, not production 4141.
 docker compose -f docker-compose.dev.yml up -d --build proxy
@@ -567,6 +620,37 @@ pwsh scripts\test.ps1
 
 Do not use the production image to install packages or run tests. Host/global
 tool changes and deployment restarts require separate approval.
+
+## Operational lessons from October 26, 2026
+
+- **Separate health from acceptance.** Docker health and `/livez` check the
+  process; readiness checks selectable catalogs. Neither proves inference, GUI
+  rendering, retained task facts, or tool continuation.
+- **Separate compaction paths.** User-tested manual `/compact` works in both
+  clients with harness-managed compaction selected. "Local" means client-managed,
+  not offline inference, and the setting does not disable automatic triggering.
+  The standalone compact API's earlier 404 does not invalidate the harness path.
+  Automatic triggering and post-compaction tool continuity remain unverified.
+- **Verify image identity, not just a version label.** Restart does not rebuild
+  code or reload `.env`; recreation uses the selected tag/override, which can
+  differ from the running image. A GitHub release also does not deploy a local
+  container. Check exact image IDs, release source hashes, and locked dependencies.
+- **Treat CI environments independently.** Some Compose versions require an
+  `env_file` to exist even with `--no-env-resolution`. Both normal and rollback
+  checks now use a shared isolated validator with an empty synthetic `.env`.
+  Never upload production credentials to satisfy CI.
+- **Distinguish cached builds from clean restores.** Hosted Linux builds passed,
+  but local ARM64 package downloads still failed TLS. An approved offline cache
+  supported a validated local rebuild; it did not fix the download problem.
+  Do not bypass TLS verification or silently substitute package sources.
+- **Clean up by artifact identity.** Multiple tags can point to one image.
+  Removing development or rollback images removes those local capabilities;
+  after the requested cleanup, only the running `0.6.0` image remained.
+  Rebuild a development image before running the full suite again. Historical
+  image IDs are evidence, not a promise that those artifacts still exist.
+
+See [architecture](ARCHITECTURE.md#operational-and-validation-boundaries) for
+the implementation boundaries behind these lessons.
 
 ## Security notes
 
