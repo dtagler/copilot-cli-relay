@@ -196,6 +196,10 @@ configure those separately with explicit authorization.
 
 `scripts/check-compose.ps1` copies only the two Compose files and `.env.example`
 to a task-owned temporary directory and creates an empty synthetic `.env` there.
+With `-RollbackImage <exact-image-id>`, it also copies and validates the rollback
+override, temporarily setting and then restoring its process-scoped image
+selector. `scripts/test-rollback.ps1` uses this same isolated validation path
+before starting its synthetic test container.
 Some Compose versions require `env_file` to exist even with
 `--no-env-resolution`. The validator never copies or reads the real `.env`,
 never starts containers, and removes only its own known scratch files.

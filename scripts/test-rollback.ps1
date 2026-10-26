@@ -5,22 +5,7 @@ $imageId = docker image inspect $Image --format '{{.Id}}'
 if ($LASTEXITCODE -ne 0 -or $imageId -notmatch '\Asha256:[0-9a-f]{64}\z') {
     throw 'The exact rollback image must already be available locally.'
 }
-$old = [Environment]::GetEnvironmentVariable('RELAY_ROLLBACK_IMAGE', 'Process')
-Push-Location (Split-Path $PSScriptRoot)
-try {
-    $env:RELAY_ROLLBACK_IMAGE = $imageId
-    $raw = docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.rollback.yml config --no-env-resolution --format json
-    if ($LASTEXITCODE -ne 0) { throw 'Rollback Compose validation failed.' }
-    $service = (($raw -join "`n") | ConvertFrom-Json).services.proxy
-    if ($service.image -ne $imageId -or $service.volumes -or $service.read_only -ne $true -or
-        $service.ports[0].host_ip -ne '127.0.0.1' -or
-        ($service.healthcheck.test -join ' ') -notlike '*/claude/healthz*') {
-        throw 'Rollback configuration does not preserve the deployment contract.'
-    }
-} finally {
-    Pop-Location
-    [Environment]::SetEnvironmentVariable('RELAY_ROLLBACK_IMAGE', $old, 'Process')
-}
+& (Join-Path $PSScriptRoot 'check-compose.ps1') -RollbackImage $imageId
 $owner = [guid]::NewGuid().ToString('N')
 $name = 'relay-rollback-test-' + $owner
 try {

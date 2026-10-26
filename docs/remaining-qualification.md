@@ -172,6 +172,29 @@ does not contain the dependency cache or development tooling. No inference,
 live restart, image publication, or GitHub release was performed during this
 preparation. Publication awaits the reviewed fix commit and successful hosted CI.
 
+### Second hosted run and rollback validation
+
+The fix was committed and pushed as `618e9d7`. Hosted run `40385373881` on
+October 26, 2026 passed the Windows helpers, Linux development build/Python
+checks, isolated Compose check, production image build, smoke/idle shutdown,
+and active-stream shutdown. Its final rollback-adapter step failed because that
+helper had a separate Compose invocation in the source checkout, encountering
+the same missing `.env` requirement. The release was not published.
+
+The rollback helper now calls the shared isolated validator with the exact image
+ID. The validator copies the rollback override into its synthetic directory and
+checks the merged image, legacy health route, and deployment safety properties.
+It restores both existing and absent process-scoped rollback selectors.
+All Compose-config invocations used by these validation scripts now run in
+the isolated directory.
+
+Expanded synthetic tests pass 112 Compose assertions, covering clean/existing
+source env files, exact image selection, wrong image/health route, native command
+failure, environment/location restoration, and scratch cleanup. The real offline
+rollback rehearsal passes on the rebuilt candidate. Full hosted success is still
+required after this follow-up; earlier passing stages do not make the failed
+workflow green.
+
 ## User-assisted GUI acceptance
 
 On October 26, 2026, the user confirmed completing all five checks below and
