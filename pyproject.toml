@@ -1,6 +1,6 @@
 [project]
 name = "copilot-cli-relay"
-version = "0.6.0"
+version = "0.7.0"
 description = "GitHub Copilot relay for Claude Code, Codex CLI, and Codex in the ChatGPT desktop app, using native protocol endpoints."
 requires-python = ">=3.14"
 dependencies = [

@@ -1540,13 +1540,15 @@ def test_healthz_upstream_not_ok():
 
 
 def test_healthz_upstream_token_expired_hint():
-    """401/403 from upstream: include actionable hint pointing at extract-token.ps1."""
+    """401/403 from upstream: include actionable, host-independent credential guidance."""
     client, _ = _make_client(lambda req: httpx.Response(401, content=b"bad token"))
     body = client.get("/claude/healthz").json()
     assert body["upstream_ok"] is False
     assert body["upstream_status"] == 401
-    assert "extract-token.ps1" in body["hint"]
-    assert "docker compose up -d --force-recreate proxy" in body["hint"]
+    assert "container environment" in body["hint"]
+    assert "verify the intended image" in body["hint"]
+    assert "recreate the container" in body["hint"]
+    assert "extract-token.ps1" not in body["hint"]
 
 
 def test_healthz_upstream_200_non_json_body_is_not_ok():

@@ -5,7 +5,7 @@ services:
     build:
       context: .
       target: production
-    image: ${RELAY_IMAGE:-copilot-cli-relay:0.6.0}
+    image: ${RELAY_IMAGE:-copilot-cli-relay:0.7.0}
     container_name: copilot-cli-relay
     env_file:
       - .env
@@ -38,7 +38,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    # `unless-stopped` so the proxy survives Docker Desktop / host reboots
-    # without manual `docker compose up`. `docker compose down` and Ctrl-C
-    # still stop it cleanly. Crashes are visible in `docker compose logs`.
+    # Restart after a daemon restart unless explicitly stopped. Starting the
+    # Docker engine itself is the operator's responsibility. `compose down`
+    # still stops the service. Crashes are visible in `docker compose logs`.
     restart: unless-stopped

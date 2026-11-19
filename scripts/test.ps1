@@ -6,7 +6,7 @@ $imageId = docker image inspect $Image --format '{{.Id}}'
 if ($LASTEXITCODE -ne 0 -or $imageId -notmatch '\Asha256:[0-9a-f]{64}\z') {
     throw 'Build the development target first. This script does not install tools or pull images.'
 }
-$mounts = @(foreach ($item in @('src','tests','scripts','docs','assets','skill','README.md','ARCHITECTURE.md','GLOSSARY.md','LICENSE','pyproject.toml','uv.lock')) {
+$mounts = @(foreach ($item in @('src','tests','scripts','docs','assets','skill','README.md','ARCHITECTURE.md','LICENSE','pyproject.toml','uv.lock')) {
     '--mount'
     "type=bind,source=$(Join-Path $root $item),target=/app/$item,readonly"
 })

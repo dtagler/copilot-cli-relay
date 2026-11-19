@@ -689,7 +689,10 @@ async def claude_healthz(request: Request) -> Response:
                 model_count = sum(1 for m in data if _is_anthropic(m))
                 upstream_ok = True
         elif resp.status_code in (401, 403):
-            hint = "token may be expired; re-run scripts/extract-token.ps1 then docker compose up -d --force-recreate proxy"
+            hint = (
+                "token may be expired; refresh the authorized Copilot token in the container environment, "
+                "verify the intended image, and recreate the container to load the updated configuration."
+            )
     except Exception as exc:
         logger.warning("claude_healthz upstream check failed: %s", redact_text(str(exc)))
     body = {

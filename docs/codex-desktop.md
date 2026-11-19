@@ -45,7 +45,8 @@ Codex integration, not a requirement to install a separate product.
 
 The [official environment guide](https://learn.chatgpt.com/docs/environments/modes)
 distinguishes local and cloud execution. A cloud task's `127.0.0.1` is not this
-computer's relay. The [glossary](../GLOSSARY.md) records the naming used here.
+computer's relay. The [architecture terminology](../ARCHITECTURE.md#terminology)
+records the naming used here.
 
 ## Prerequisites and checks
 

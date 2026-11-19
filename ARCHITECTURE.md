@@ -10,10 +10,34 @@ This file is the contract for anyone modifying the proxy: what each piece does, 
 
 The app integration covers local Codex model traffic, not ChatGPT Chat/Work,
 cloud execution, or all app services. The [app guide](docs/codex-desktop.md)
-contains setup and dated validation; the [glossary](GLOSSARY.md) distinguishes
+contains setup and dated validation; the [terminology](#terminology) below distinguishes
 the unified app from the historical "Codex Desktop" name. Existing `/codex/v1`
 routes, provider IDs, helper filenames, and the tested `OpenAI.Codex` package
 identifier remain unchanged.
+
+---
+
+## Terminology
+
+Client and routing terms follow the
+[ChatGPT desktop app documentation](https://learn.chatgpt.com/docs/app),
+checked on October 18, 2026:
+
+| Term | Meaning and usage |
+|---|---|
+| **ChatGPT desktop app** | The unified desktop application containing ChatGPT and Codex experiences. Prefer this over the historical "Codex Desktop" product label. |
+| **Codex in the ChatGPT desktop app** | The Codex experience within the unified app, distinct from ChatGPT Chat and Work. Do not describe this integration as support for all ChatGPT traffic. |
+| **Codex Desktop** | The historical label for the desktop Codex experience, now accessed within the unified app. |
+| **Local Codex chat** | A Codex conversation whose execution environment is the user's computer, rather than a cloud environment. Do not call it a cloud task. |
+| **Relay provider** | The named Codex model connection pointing to this project's relay. It is not the Copilot credential. |
+| **Copilot upstream** | The GitHub Copilot service that authenticates and serves the forwarded model request. The relay's destination is not the direct OpenAI or Anthropic API. |
+
+The server is a Linux container with a standard HTTP interface. Its image does
+not require a particular host OS, desktop application, shell, or Docker
+installation layout. The Compose files provide a local, hardened reference
+deployment; operators own their container runtime, networking, credentials, and
+startup integration. Client-specific helpers and dated client qualifications
+are separate from this server contract.
 
 ---
 
@@ -40,12 +64,12 @@ identifier remain unchanged.
                                                             |
                                                             |
                                       .env: COPILOT_GITHUB_TOKEN
-                                      extracted from Windows Credential Manager
+                                      supplied by the operator at runtime
 ```
 
 Four things make this work cleanly:
 
-1. The `copilot` CLI's OAuth token (Windows Credential Manager) authenticates **directly** against `api.githubcopilot.com`. No token-exchange step.
+1. The operator-supplied Copilot OAuth token authenticates **directly** against `api.githubcopilot.com`. No token-exchange step. The optional Windows extraction helper is one credential-provisioning method, not a server requirement.
 2. Copilot's `/v1/messages` speaks the Anthropic protocol natively for Claude models — proper SSE event names, no transcoding.
 3. Copilot's `/responses` speaks the OpenAI Responses protocol natively for GPT/Codex models.
 4. `Copilot-Integration-Id: copilot-developer-cli` is the tested integration identity for both routes. Other integration IDs can expose different catalogs; do not change this as part of app setup.
@@ -112,6 +136,7 @@ src/copilot_cli_relay/
 |-- limits.py             # Upload/concurrency/deadline and disconnect ownership
 |-- health.py             # Cheap liveness and selectable-catalog readiness
 |-- proxy_shared.py       # Streaming ownership, framing, bounded error reads
+|-- request_diagnostics.py # Content-free request sizes and bounded category estimates
 |-- errors.py             # Protocol-specific JSON and SSE errors
 `-- logging_setup.py      # Logging and best-effort secret redaction
 
@@ -136,7 +161,6 @@ tests/powershell/        # Dependency-free config/lifecycle/Compose/helper tests
 tests/integration/       # Network-isolated operational rehearsal fixtures
 tests/fixtures/          # Non-sensitive manual acceptance fixture
 docs/codex-desktop.md    # App configuration, evidence, and compatibility limits
-GLOSSARY.md              # Client and routing terminology
 ```
 
 `Dockerfile`, `docker-compose.yml`, `pyproject.toml`, and `uv.lock` define the
@@ -222,6 +246,32 @@ Key invariants:
 - **Channel buffer = 8** applies backpressure to slow clients; the decoder yields at most 64 KiB per queued chunk.
 - **Decoding:** `decoded_chunks()` uses raw wire bytes and bounded decoding. Outbound headers explicitly negotiate `gzip, identity`, overriding client preferences. Gzip, including concatenated members, and zlib-wrapped deflate can be decoded; unsupported encodings or encoding chains fail as protocol errors. Never restore HTTPX's unbounded decoder.
 - **Pre-stream errors return real HTTP status.** `_stream_response` and `_codex_stream_response` open upstream with `client.send(req, stream=True)` and inspect `upstream.status_code` *before* returning a `StreamingResponse`. If upstream answered >=400 before any body byte was forwarded, the proxy returns a `JSONResponse` with the upstream status (`401`, `429`, ...) and the route's error envelope. Only failures observed *after* the stream has started surface as terminal SSE error frames. This lets SDK retry logic that keys on HTTP status (`401` -> re-auth, `429` -> backoff) fire correctly. The bounded-read helper (`read_bounded`, 32 KiB cap) prevents a hostile or runaway upstream error body from being read into memory unbounded.
+- **Explicit Codex payload compatibility exception.** With `COPILOT_CODEX_TERMINAL_PAYLOAD_ERRORS=1`, local upload and upstream HTTP 413 errors become HTTP 400 `request_too_large` errors. Original status and origin remain in response headers and logs. Default behavior is still 413; Claude and non-413 statuses are unaffected. This avoids the inspected Codex CLI's retryable unexpected-status path, but does not reduce a request or promise recovery. Byte overflow is never rewritten to `context_length_exceeded`.
+- **Structured error fidelity.** Complete bounded upstream JSON errors retain allowlisted code and parameter fields. In particular, HTTP 400 `context_length_exceeded` remains a context-specific signal rather than a generic invalid request. Malformed/truncated bodies retain their HTTP status without inventing fields.
+
+### Request size and compaction policy
+
+The upload default is 32 MiB, configurable independently of model token context.
+Admission still bounds both Content-Length and streamed uploads. A larger cap
+can increase peak memory under concurrency and does not change upstream limits.
+The middleware generates correlation IDs for Codex request-size/error records;
+it never trusts a caller-supplied ID for those records.
+
+`request_diagnostics.py` emits content-free exact incoming/outgoing lengths and
+compact-JSON category estimates while the parsed request is already available.
+It does not parse the request again, mutate history, or log identifiers/content.
+Its model and effort labels are fixed categories. Estimates are not exact wire
+accounting; images belong to their containing input item. A shared 8192 encoder
+chunk budget bounds traversal across nested input, tools and instructions.
+Exhaustion or errors mark estimates unavailable rather than stalling the event
+loop on arbitrarily many items or rejecting a forwardable request.
+
+`COPILOT_CODEX_MODEL_OVERRIDES` can additionally set a per-model
+`auto_compact_token_limit`. Positive integers are bounded and the published value
+is clamped to 90% of the validated context window (minimum one token). This is
+opt-in and does not alter model IDs, routing, context windows, or the selected
+compaction implementation. The relay never summarizes or discards history
+automatically. See [policy and qualification](docs/compaction.md#request-byte-limits).
 
 ### Stream ownership and cancellation
 
@@ -491,12 +541,12 @@ The `COPILOT_CODEX_*` settings below apply to both Codex clients.
     <tr>
       <td width="320"><code>LOG_LEVEL</code></td>
       <td><code>info</code></td>
-      <td><code>debug</code> enables header-level debug logging.</td>
+      <td><code>debug</code> enables detailed diagnostics. Request bodies also require <code>LOG_BODIES=1</code>.</td>
     </tr>
     <tr>
       <td width="320"><code>LOG_BODIES</code></td>
       <td><code>0</code></td>
-      <td><code>1</code> enables redacted body logging. Bodies contain the user's source code.</td>
+      <td><code>1</code> enables bounded, redacted upstream error-body logging. Request bodies additionally require <code>LOG_LEVEL=debug</code>; successful response and SSE bodies are not logged by these paths. Bodies may contain the user's source code.</td>
     </tr>
   </tbody>
 </table>
@@ -539,7 +589,7 @@ the limit, or unknown secret formats. Do not share diagnostics automatically.
 
 ## Security model
 
-- **Bind:** `127.0.0.1:4141` only. The Docker port-publish enforces this; the `__main__` entrypoint also defaults to it.
+- **Bind:** the reference Compose deployment publishes `127.0.0.1:4141` on the host. The image's default command listens on `0.0.0.0:4141` inside the container; other deployments must preserve equivalent private access restrictions. The separate `__main__` entrypoint defaults to loopback.
 - **Browser cross-site guard:** `server.py` installs `security.LoopbackHostMiddleware` for `localhost`, `127.0.0.1`, and `[::1]` only, then `security.LocalBrowserGuardMiddleware` rejects non-loopback `Origin` headers, `Sec-Fetch-Site: cross-site`, and non-JSON POSTs to `/claude/v1/messages`, `/codex/v1/responses`, and `/codex/v1/responses/compact`. This prevents DNS rebinding and CORS-simple POSTs from driving the relay with the user's Copilot token.
 - **No client-supplied auth ever reaches upstream.** `Authorization`, `x-api-key`, `proxy-authorization`, `Cookie`, and `User-Agent` are stripped in `headers.build_claude_outbound_headers`; regression-tested. Upstream `Set-Cookie` is similarly dropped from responses returned to the client.
 - **Codex local session headers do not reach upstream.** The Codex path rebuilds headers from settings and drops Codex-specific local headers such as `x-codex-turn-metadata`, `session_id`, and `thread_id`.
@@ -624,6 +674,7 @@ Coverage hot-spots that matter:
 - Body redaction - every pattern has a positive test.
 - Hop-by-hop headers - both `Trailer` (singular) and `Trailers` are covered on inbound and outbound.
 - Codex routes - non-streaming, streaming, compact fallback, model catalog, health, malformed input, upstream error-body failures, and OpenAI SSE error shape are covered.
+- Payload limits - exact 32 MiB acceptance and overflow rejection, declared/chunked uploads, opt-in local/upstream Codex terminal errors, context-code preservation, content-free size estimates, and bounded per-model compaction policy.
 - Stream lifetimes - fragmented events, early close, blocked producers, header/body send failure, repeated cancellation, and one-shot transport cleanup.
 - Tool replay - function/custom call and result preservation, initiator classification, and invalid tool-choice cleanup.
 - App helper - loopback-only URL validation, reserved provider IDs, TOML escaping, one resolved auth executable, both catalog shapes, and fail-closed prerequisite checks.

@@ -18,10 +18,10 @@
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/python-3.14+-blue?logo=python&logoColor=white">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-689%20passing-brightgreen?logo=pytest&logoColor=white">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-773%20passing-brightgreen?logo=pytest&logoColor=white">
   <img alt="Coverage" src="https://img.shields.io/badge/coverage-99%25-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?logo=windows11&logoColor=white">
+  <img alt="Runtime" src="https://img.shields.io/badge/runtime-Linux%20container-blue?logo=docker&logoColor=white">
 </p>
 
 <p align="center">
@@ -71,7 +71,7 @@ a unified ChatGPT desktop app containing Codex. This repo retains
 `codex-desktop.ps1`, `docs/codex-desktop.md`, and existing provider IDs for
 compatibility. "Codex Desktop" in older records means that Codex experience, not
 support for all ChatGPT traffic. Worktree mode also runs locally, but has not
-been separately qualified here. See the [glossary](GLOSSARY.md) for terminology
+been separately qualified here. See [architecture terminology](ARCHITECTURE.md#terminology)
 and [architecture](ARCHITECTURE.md) for implementation boundaries.
 
 The [project review](docs/project-review-2026-10-18.md) records four inherited
@@ -83,7 +83,16 @@ The [full-project review](docs/project-review-2026-10-26.md) records the later
 promotion/hardening regression fixes and the distinction between reviewed source
 and the deployed image.
 
-### Release validation: October 26, 2026
+### v0.7.0: request-size handling
+
+The [v0.7.0 release notes](docs/releases/v0.7.0.md) cover the 32 MiB upload
+default, structured Codex errors, opt-in terminal payload failures, bounded
+size diagnostics, and earlier per-model compaction policy. The production image
+defaults to `copilot-cli-relay:0.7.0`; an existing `RELAY_IMAGE` override still
+takes precedence. Follow the [image-selection checks](docs/operations.md#image-selection-before-recreation)
+before recreating a container.
+
+### Previous release validation: October 26, 2026
 
 Version **v0.6.0** was published from commit `6c71885`. The final
 [hosted workflow](https://github.com/dtagler/copilot-cli-relay/actions/runs/40386404641)
@@ -116,7 +125,7 @@ These are release-specific results, not proof of every client/platform combinati
                                                             |
                                                             |
                                       .env: COPILOT_GITHUB_TOKEN
-                                      extracted from Windows Credential Manager
+                                      supplied by the operator at runtime
 ```
 
 | Client | Local relay routes | Upstream Copilot routes | Protocol |
@@ -143,62 +152,91 @@ route remains available for explicit callers; its synthetic fallback stays off.
 
 Four things make this work cleanly:
 
-1. The `copilot` CLI's OAuth token (in Windows Credential Manager) authenticates directly against `api.githubcopilot.com` — **no session-token exchange needed**.
+1. An operator-supplied Copilot OAuth token authenticates directly against `api.githubcopilot.com`. No session-token exchange is needed; the server does not depend on a particular host credential store.
 2. Copilot exposes a native Anthropic Messages endpoint at `/v1/messages` that returns proper Anthropic SSE — **no API translation needed**.
 3. Copilot exposes a native OpenAI Responses endpoint at `/responses` for GPT/Codex models — **no Chat Completions translation needed**.
 4. Setting `Copilot-Integration-Id: copilot-developer-cli` is what unlocks Claude and GPT-5 Responses models on this Copilot tenant (`vscode-chat` rejected `gpt-5.5` during live testing).
 
 ## Start the shared relay
 
-Use an existing Docker Desktop installation, PowerShell 7+ (`pwsh`), and a
-working `copilot` CLI login. Start one relay for all clients. App-only use does
-not require a separate Codex CLI installation; the tested app bundles its engine.
+The deliverable is a **Linux container image**. Use a Docker environment capable
+of running Linux containers; Docker Compose is needed only for the supplied
+reference deployment. The server does not require PowerShell, Windows, a
+desktop app, or a particular host installation layout. You choose how to run
+the image and manage its lifecycle.
 
-```powershell
-# First-time setup: extract the Copilot OAuth token to the ignored .env file
-pwsh scripts\extract-token.ps1
+The image listens on port **4141** and reads `COPILOT_GITHUB_TOKEN` from its
+runtime environment. The reference Compose deployment publishes that port only
+on host loopback, runs non-root/read-only, and applies resource and logging
+limits. These security boundaries are not an Internet-facing authentication
+layer. Keep the relay private; do not simply publish it on a public interface.
+See the [container contract](docs/operations.md#container-and-operator-contract)
+when using your own runtime or orchestration.
 
-# First-time deployment only: build a separate candidate, then validate it.
-$candidate = 'copilot-cli-relay:candidate-' + [guid]::NewGuid().ToString('N')
-docker build --target production -t $candidate .
-if ($LASTEXITCODE -ne 0) { throw 'Production build failed; do not deploy.' }
-pwsh scripts\check-compose.ps1
-if ($LASTEXITCODE -ne 0) { throw 'Compose validation failed; do not deploy.' }
-pwsh scripts\test-image.ps1 -Image $candidate
-if ($LASTEXITCODE -ne 0) { throw 'Image validation failed; do not deploy.' }
-pwsh scripts\test-stream-shutdown.ps1 -Image $candidate
-if ($LASTEXITCODE -ne 0) { throw 'Shutdown validation failed; do not deploy.' }
+### Reference Docker Compose deployment
 
-# After deployment approval; for upgrades, preserve rollback first.
-$previousSelection = [Environment]::GetEnvironmentVariable('RELAY_IMAGE', 'Process')
-try {
-    $env:RELAY_IMAGE = $candidate
-    docker compose up -d --no-build --pull never --wait proxy
-    if ($LASTEXITCODE -ne 0) { throw 'Deployment failed; inspect before retrying.' }
-} finally {
-    if ($null -eq $previousSelection) {
-        [Environment]::SetEnvironmentVariable('RELAY_IMAGE', [NullString]::Value, 'Process')
-    } else {
-        [Environment]::SetEnvironmentVariable('RELAY_IMAGE', $previousSelection, 'Process')
-    }
-}
+Run these steps from the repository root, stopping on any failed command:
 
-# Read-only health checks, bypassing any shell proxy configuration
-Invoke-RestMethod http://127.0.0.1:4141/claude/healthz -NoProxy
-Invoke-RestMethod http://127.0.0.1:4141/codex/healthz -NoProxy
-```
+1. Copy `.env.example` to the ignored `.env` using your preferred file tools.
+   Populate `COPILOT_GITHUB_TOKEN` from your authorized Copilot credential
+   source. Do not put credentials in command arguments or committed files.
+   Windows users can optionally use `pwsh scripts/extract-token.ps1`; that helper
+   is not a server prerequisite.
+2. Build and validate an image. The example below is for a first deployment
+   where the version tag is not already in use. For upgrades, preserve the
+   running image and use a new candidate/version tag rather than overwriting it.
 
-Check `upstream_ok`, `upstream_status`, and the relevant model count, not just
-HTTP 200 or Docker's `healthy` label. These checks do not exercise inference.
-If the relay is already configured and healthy, skip token extraction and startup.
-Before any later `compose up`, deliberately persist the validated image selection
-using the [deployment procedure](docs/operations.md#image-selection-before-recreation).
-The temporary override above does not update the default image tag. If a build
-fails at package-host TLS, stop; do not disable certificate verification.
+   ```sh
+   docker build --target production -t copilot-cli-relay:0.7.0 .
+   docker image inspect copilot-cli-relay:0.7.0 --format '{{.Id}}'
+   ```
+
+   Use the applicable [development and release checks](#development) before
+   deployment. Building an image alone does not establish client compatibility.
+3. Set `RELAY_IMAGE=copilot-cli-relay:0.7.0` in `.env`, or the exact tag/digest of
+   your validated candidate. Compose uses `.env` for interpolation and the
+   supplied service also uses it as `env_file`. Verify that the resolved image
+   below is the intended one. If it differs, stop and resolve the override.
+
+   ```sh
+   docker compose -f docker-compose.yml config --images
+   docker image inspect copilot-cli-relay:0.7.0 --format '{{.Id}}'
+   ```
+
+   Compare the selected image ID with the validated candidate, substituting
+   your chosen image reference where necessary. Do not print a fully resolved
+   Compose configuration, which can contain credentials.
+4. After deployment approval and a quiet maintenance window:
+
+   ```sh
+   docker compose -f docker-compose.yml up -d --no-build --pull never --wait proxy
+   docker compose -f docker-compose.yml ps proxy
+   docker inspect copilot-cli-relay --format '{{.Image}}'
+   ```
+
+   Confirm the running image matches the validated selection. Check `/livez`,
+   `/codex/readyz`, and/or `/claude/readyz` with your HTTP client. Readiness is a
+   metadata check, not an inference test or a guarantee about client workflows.
+
+The default endpoint is `http://127.0.0.1:4141` on the **Docker host**. Clients on
+another machine need a deliberate, secured connectivity arrangement;
+their own loopback address is not the Docker host. Container-engine installation,
+startup integration, remote access, and custom CLI wrappers are operator choices.
+The optional client and maintenance scripts below use PowerShell 7 and are
+separate from the container runtime.
+
+If the relay is already configured and healthy, skip credential extraction and
+startup. Before later recreations, follow the
+[image-selection checks](docs/operations.md#image-selection-before-recreation).
+If a build fails at package-host TLS, stop; do not disable certificate verification.
 
 ## Claude Setup
 
 Start the shared relay above, then point your installed Claude Code at it:
+
+The PowerShell helper below is an optional Windows convenience. It configures
+the client, not the container; you can also apply the shown client settings
+manually using the tools appropriate for your platform.
 
 ```powershell
 # Print the Claude Code settings snippet
@@ -223,7 +261,7 @@ The helper writes the same settings as this manual `~/.claude/settings.json` exa
 }
 ```
 
-Then restart Claude Code and run `claude` as usual. If Claude Code logs show `POST /v1/messages` instead of `POST /claude/v1/messages`, the base URL is missing the `/claude` suffix; rerun `pwsh scripts\claude-config.ps1 -Write`.
+Then restart Claude Code and run `claude` as usual. If its logs show `POST /v1/messages` instead of `POST /claude/v1/messages`, correct the base URL to include the `/claude` suffix. Windows users can optionally apply that correction with `claude-config.ps1 -Write`.
 
 <a id="codex-setup"></a>
 
@@ -232,6 +270,11 @@ Then restart Claude Code and run `claude` as usual. If Claude Code logs show `PO
 Start the shared relay above and use your installed Codex CLI. For Codex inside
 the ChatGPT app, use the [separate app setup](#chatgpt-desktop-app-setup-codex-on-windows)
 instead of the CLI writer.
+
+The supplied writer is an optional Windows/PowerShell 7 client helper.
+Manual configuration is also possible; the example command-backed dummy auth
+below uses `pwsh` on the **client**, not inside the relay image. Use your client's
+supported configuration mechanisms when adapting it to another platform.
 
 Codex uses its own path prefix so Claude Code's `/claude/v1/models` response stays Anthropic-shaped while Codex gets OpenAI Responses-compatible routes:
 
@@ -428,7 +471,7 @@ Optional env vars to consider adding to the `"env"` block:
     <tr>
       <td width="310"><code>COPILOT_GITHUB_TOKEN</code></td>
       <td>-</td>
-      <td><strong>Required.</strong> Set by <code>extract-token.ps1</code>.</td>
+      <td><strong>Required.</strong> Supply an authorized Copilot OAuth token through the container environment. The Windows <code>extract-token.ps1</code> helper is optional.</td>
     </tr>
     <tr>
       <td width="310"><code>COPILOT_PROXY_PORT</code></td>
@@ -498,12 +541,12 @@ Optional env vars to consider adding to the `"env"` block:
     <tr>
       <td width="310"><code>LOG_LEVEL</code></td>
       <td><code>info</code></td>
-      <td>Set to <code>debug</code> for header-level debug.</td>
+      <td>Set to <code>debug</code> for detailed diagnostics. Request-body logging also requires <code>LOG_BODIES=1</code>.</td>
     </tr>
     <tr>
       <td width="310"><code>LOG_BODIES</code></td>
       <td><code>0</code></td>
-      <td>Set to <code>1</code> to log redacted request/response bodies. <strong>Bodies contain your source code; off by default.</strong></td>
+      <td>Set to <code>1</code> for bounded, redacted upstream error-body logging. Request bodies additionally require <code>LOG_LEVEL=debug</code>; successful response and SSE bodies are not logged by these paths. <strong>Bodies may contain your source code; off by default.</strong></td>
     </tr>
   </tbody>
 </table>
@@ -511,12 +554,13 @@ Optional env vars to consider adding to the `"env"` block:
 ## Troubleshooting
 
 - **`/claude/v1/models` returns no Claude models:** your `COPILOT_INTEGRATION_ID` is wrong, or your org policy doesn't include Claude models for your account.
-- **401 from upstream:** the Copilot token may have expired or rotated. Refresh it with `pwsh scripts\extract-token.ps1`, verify the [selected image](docs/operations.md#image-selection-before-recreation) matches the running artifact, then recreate with `docker compose up -d --no-build --pull never --force-recreate proxy` so Compose reloads `.env` without selecting different code. If it persists, check account access rather than changing app credentials.
-- **`COPILOT_GITHUB_TOKEN is required`:** run `extract-token.ps1` first; it writes `.env`.
+- **401 from upstream:** the Copilot token may have expired or rotated. Refresh it through your authorized credential workflow, verify the [selected image](docs/operations.md#image-selection-before-recreation), and recreate the container to load the updated environment. With the reference Compose setup, use `docker compose up -d --no-build --pull never --force-recreate proxy` after those checks. Windows users can optionally use `extract-token.ps1`. If failures persist, check account access rather than changing app credentials.
+- **`COPILOT_GITHUB_TOKEN is required`:** supply it in the container environment. With the reference Compose setup, populate the ignored `.env` file before creating the container; the Windows extraction helper is optional.
 - **Source edits not picked up:** production uses an installed wheel with no source mounts. Build and validate a new image, then recreate the container. Only the separate development stack picks up source edits on restart.
 - **`Unable to connect to API (ConnectionRefused)` in Claude Code:** check whether the container is running. Verify the [selected image](docs/operations.md#image-selection-before-recreation) against the recorded deployment, then use `docker compose up -d --no-build --pull never proxy` to start that existing image. Do not infer the cause solely from a connection refusal.
-- **Claude Code posts to `/v1/messages` and gets 404:** your Claude base URL is missing the namespace. Run `pwsh scripts\claude-config.ps1 -Write`, restart Claude Code, and confirm `ANTHROPIC_BASE_URL` is `http://127.0.0.1:4141/claude`.
+- **Claude Code posts to `/v1/messages` and gets 404:** your Claude base URL is missing the namespace. Set `ANTHROPIC_BASE_URL` to `http://127.0.0.1:4141/claude` and restart Claude Code. The Windows configuration helper is an optional way to apply this setting.
 - **Codex says stream disconnected before completion:** confirm the proxy is running and Codex is pointed at `http://127.0.0.1:4141/codex/v1`, not the Claude base URL `http://127.0.0.1:4141/claude`.
+- **Codex repeats HTTP 413 / "Request body too large." before the context meter is full:** request bytes and token context are separate limits. The upload default is now 32 MiB (previously 16 MiB), but existing overrides and upstream limits still apply. Use the content-free [size diagnostics](docs/operations.md#request-size-diagnostics), opt-in terminal payload errors, and [earlier per-model compaction](docs/compaction.md#request-byte-limits). Do not increase retries or silently strip history. Source edits do not update a running production container.
 - **Codex CLI `/model` only shows bundled models:** compare the printed CLI provider with your selected profile and command-auth setup. `codex-config.ps1 -Write` manages and replaces the sections described above; do not run it blindly over a customized profile or use it to repair the app.
 - **Codex CLI missing auth:** confirm the selected provider has the matching `[model_providers.<id>.auth]` table. Distinguish local auth-helper failures from an upstream Copilot 401.
 - **Codex errors with `--profile copilot cannot be used while ... contains legacy profile = "copilot" or [profiles.copilot] config`:** Codex 0.134+ moved profiles into their own file. Re-run `pwsh scripts\codex-config.ps1 -Write` (it removes the legacy `[profiles.copilot*]` tables from `config.toml` and writes the profile to `~/.codex/copilot.config.toml`). To migrate by hand, move the keys under `[profiles.copilot]` into `~/.codex/copilot.config.toml` as top-level keys (drop the `profiles.copilot` prefix) and delete the legacy tables.
@@ -554,10 +598,27 @@ Upstream model availability and request schemas change without notice. Reasoning
 ## Development
 
 **Python development and tests run in the Docker development target, not the
-production image or a host Python environment.** The default test suite does not
-load `.env` or make real inference requests. Live qualification harnesses are
-separate and explicitly opt-in. The PowerShell 7 test suite uses synthetic
-processes and temporary loopback listeners; it needs no installed test framework.
+production image or a host Python environment.** The following Docker commands
+test the source copied into the development image without host bind mounts.
+Rebuild after source changes; stop if either command fails. No credentials or
+real inference requests are used.
+
+```sh
+docker build --target development -t copilot-cli-relay:dev-hardening .
+docker run --rm --pull never --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=128m --env COVERAGE_FILE=/tmp/.coverage --env UV_CACHE_DIR=/tmp/uv-cache copilot-cli-relay:dev-hardening /bin/sh -c 'uv lock --check --offline && uv sync --check --frozen --offline --no-install-project --inexact && /app/.venv/bin/ruff check --no-cache src tests scripts && /app/.venv/bin/coverage run --source=copilot_cli_relay -m pytest tests/unit -q -p no:cacheprovider && /app/.venv/bin/coverage report --fail-under=98 && /app/.venv/bin/python scripts/check-docs.py'
+```
+
+### Optional PowerShell maintenance tools
+
+These helpers are conveniences, not runtime requirements. They expect a Docker
+CLI that sees the same process environment and filesystem paths as the shell.
+Bind sources must be accessible to the selected Docker engine. Operators using
+a remote daemon or custom launcher should adapt paths and environment handling
+outside this repository, or use the image-based checks above.
+
+The PowerShell 7 test suite uses synthetic processes and temporary loopback
+listeners; it needs no installed test framework. Live qualification harnesses
+are separate and explicitly opt-in.
 
 ```powershell
 # Build the test environment from pinned base images and the lockfile.
@@ -613,8 +674,12 @@ project is intentionally excluded because source is mounted from this checkout.
 ```powershell
 $image = docker image inspect copilot-cli-relay:dev-hardening --format '{{.Id}}'
 if ($LASTEXITCODE -ne 0) { throw 'Build the development image first.' }
-docker run --rm --mount "type=bind,source=${PWD}/pyproject.toml,target=/app/pyproject.toml,readonly" --mount "type=bind,source=${PWD}/uv.lock,target=/app/uv.lock" $image uv lock
+$manifestSource = (Resolve-Path -LiteralPath ./pyproject.toml).ProviderPath
+$lockSource = (Resolve-Path -LiteralPath ./uv.lock).ProviderPath
+docker run --rm --pull never --mount "type=bind,source=$manifestSource,target=/app/pyproject.toml,readonly" --mount "type=bind,source=$lockSource,target=/app/uv.lock" $image uv lock
+if ($LASTEXITCODE -ne 0) { throw 'Lock update failed; do not rebuild.' }
 docker build --target development -t copilot-cli-relay:dev-hardening .
+if ($LASTEXITCODE -ne 0) { throw 'Development build failed.' }
 pwsh scripts\test.ps1
 ```
 
@@ -656,7 +721,7 @@ the implementation boundaries behind these lessons.
 
 - Compose loads the OAuth token from `.env` when creating the container; the proxy reads its environment at process startup and never persists the token. Recreate the container after changing `.env`.
 - `extract-token.ps1` writes `.env` with a hardened ACL: inheritance is disabled and dropped, then explicit ACEs are added for the current user and `NT AUTHORITY\SYSTEM`. In practice the resulting on-disk DACL also includes `BUILTIN\Administrators` with FullControl when the script is run by an account in that group; the script does not strip this. It refuses to write the token if the ACL hardening fails. On a single-user dev box this is "owner-only" in practice; on a host with multiple local Administrators, anyone in that group can read the file.
-- The proxy binds only to `127.0.0.1:4141` on the host. Not reachable from the network.
+- The reference Compose deployment publishes port 4141 only on host loopback. The image's default command listens on `0.0.0.0:4141` inside the container; other deployments must preserve equivalent private access restrictions.
 - The app also rejects non-loopback `Host` headers, browser cross-site `Origin` / `Sec-Fetch-Site` requests, and non-JSON POSTs to proxy endpoints. This blocks DNS-rebinding and simple-form browser requests before the relay injects the Copilot token.
 - The container runs as a non-root user (UID 1000).
 - Inbound `Authorization`, `x-api-key`, `proxy-authorization`, `Cookie`, and `User-Agent` headers from clients are stripped before any upstream forward (regression-tested). Upstream `Set-Cookie` is stripped from responses returned to the client.

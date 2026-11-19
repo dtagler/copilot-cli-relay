@@ -31,9 +31,12 @@ def _positive_int(name: str, default: int, maximum: int) -> int:
     return value
 
 
-def _model_overrides() -> dict[str, dict[str, bool]]:
+def _model_overrides() -> dict[str, dict[str, bool | int]]:
     raw = os.environ.get("COPILOT_CODEX_MODEL_OVERRIDES", "{}")
-    message = "COPILOT_CODEX_MODEL_OVERRIDES must map model IDs to supported Boolean capability overrides."
+    message = (
+        "COPILOT_CODEX_MODEL_OVERRIDES must map model IDs to supported Boolean capabilities "
+        "or auto_compact_token_limit integers between 1 and 10000000."
+    )
     if len(raw) > 65536:
         raise ConfigError(message)
     try:
@@ -44,7 +47,13 @@ def _model_overrides() -> dict[str, dict[str, bool]]:
     if not isinstance(parsed, dict) or any(
         not isinstance(mid, str) or not mid or len(mid) > 128 or not mid.isprintable()
         or not isinstance(values, dict)
-        or any(key not in allowed or type(value) is not bool for key, value in values.items())
+        or any(
+            not (
+                key in allowed and type(value) is bool
+                or key == "auto_compact_token_limit" and type(value) is int and 1 <= value <= 10_000_000
+            )
+            for key, value in values.items()
+        )
         for mid, values in parsed.items()
     ):
         raise ConfigError(message)
@@ -67,7 +76,7 @@ class Settings:
     codex_github_api_version: str = "2026-01-09"
     codex_session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     codex_machine_id: str = field(default_factory=lambda: secrets.token_hex(32))
-    max_request_bytes: int = 16 * 1024 * 1024
+    max_request_bytes: int = 32 * 1024 * 1024
     max_response_bytes: int = 32 * 1024 * 1024
     max_catalog_bytes: int = 2 * 1024 * 1024
     max_inflight: int = 8
@@ -75,16 +84,17 @@ class Settings:
     request_timeout: int = 900
     max_catalog_models: int = 512
     enable_synthetic_compaction: bool = False
-    codex_model_overrides: dict[str, dict[str, bool]] = field(default_factory=dict)
+    codex_terminal_payload_errors: bool = False
+    codex_model_overrides: dict[str, dict[str, bool | int]] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> Settings:
         token = os.environ.get("COPILOT_GITHUB_TOKEN", "").strip()
         if not token:
             raise ConfigError(
-                "COPILOT_GITHUB_TOKEN is required. On the host run "
-                "`pwsh scripts/extract-token.ps1` to populate .env from the "
-                "Copilot CLI credential, then `docker compose up`."
+                "COPILOT_GITHUB_TOKEN is required. Supply an authorized Copilot OAuth token "
+                "through the container environment. For Compose, set it in the ignored "
+                ".env file before creating the container."
             )
         if not (token.startswith("gho_") or token.startswith("ghu_")):
             raise ConfigError(
@@ -138,7 +148,7 @@ class Settings:
             codex_github_api_version=os.environ.get("COPILOT_CODEX_GITHUB_API_VERSION", "2026-01-09"),
             codex_session_id=os.environ.get("COPILOT_CODEX_SESSION_ID", str(uuid.uuid4())),
             codex_machine_id=os.environ.get("COPILOT_CODEX_MACHINE_ID", secrets.token_hex(32)),
-            max_request_bytes=_positive_int("COPILOT_MAX_REQUEST_BYTES", 16 * 1024 * 1024, 128 * 1024 * 1024),
+            max_request_bytes=_positive_int("COPILOT_MAX_REQUEST_BYTES", 32 * 1024 * 1024, 128 * 1024 * 1024),
             max_response_bytes=_positive_int("COPILOT_MAX_RESPONSE_BYTES", 32 * 1024 * 1024, 128 * 1024 * 1024),
             max_catalog_bytes=_positive_int("COPILOT_MAX_CATALOG_BYTES", 2 * 1024 * 1024, 16 * 1024 * 1024),
             max_inflight=_positive_int("COPILOT_MAX_INFLIGHT", 8, 128),
@@ -146,6 +156,7 @@ class Settings:
             request_timeout=_positive_int("COPILOT_REQUEST_TIMEOUT", 900, 7200),
             max_catalog_models=_positive_int("COPILOT_MAX_CATALOG_MODELS", 512, 4096),
             enable_synthetic_compaction=_bool(os.environ.get("COPILOT_ENABLE_SYNTHETIC_COMPACTION")),
+            codex_terminal_payload_errors=_bool(os.environ.get("COPILOT_CODEX_TERMINAL_PAYLOAD_ERRORS")),
             codex_model_overrides=_model_overrides(),
         )
 

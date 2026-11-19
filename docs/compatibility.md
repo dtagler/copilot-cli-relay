@@ -7,6 +7,8 @@ qualify the desktop GUI, tools, history recovery, or compaction.
 
 | Combination | Evidence | Status |
 |---|---|---|
+| 0.7.0 release candidate, Linux ARM64 image and Windows helpers, November 18, 2026 | 773 Python tests, 99% coverage, 242 PowerShell assertions, lock/environment/lint/docs/Compose checks; runtime-only smoke, idle/active-stream shutdown, offline rollback adapter; all 15 installed module hashes match | Passed locally; hosted CI on the release commit remains a publication gate; [release evidence and limits](releases/v0.7.0.md#qualification-and-limitations) |
+| Copilot Responses route with `gpt-6.2-astra`, November 18, 2026 | Tiny synthetic prompt padded with JSON whitespace: 33554432-byte request completed, 33554433-byte request returned HTTP 413; 12 bounded calls total | Observed transport boundary for that route and model, not universal API or context qualification; [details](releases/v0.7.0.md#measured-boundaries) |
 | Windows ARM64 `OpenAI.Codex` 26.1013.4894.0, engine 0.163.0-alpha.10.2, `gpt-6-astra`, October 18, 2026 | Original GUI tool loop and separate engine/restart observations in the [desktop guide](codex-desktop.md#recorded-validation) | Historical, bounded evidence |
 | Desktop GUI checklist reported by the user, October 26, 2026 | Provider label, actual fixture read, follow-up without rereading, streamed stop/recovery, and reopening all passed | User-confirmed five-check pass, not independently observed; [evidence boundaries](remaining-qualification.md#user-assisted-gui-acceptance) |
 | 0.6.0 full-project review before the compaction follow-up, October 26, 2026 | 689 Python tests, 99% package coverage, 126 PowerShell assertions across three suites; lint/docs/Compose and lock/environment checks | Passed locally; subsequently deployed in the refresh below; hosted CI not run |
@@ -49,13 +51,19 @@ checks first. Mount only the current harness and runtime source so an older
 development image cannot silently run a superseded qualification implementation.
 No credentials or user configuration are mounted:
 
+The optional PowerShell example assumes these resolved source paths are valid
+for the selected Docker engine. Adapt that mapping in your own environment
+when using a remote daemon or custom launcher.
+
 ```powershell
 # Requires approval for inference and the exact model. Do not substitute a model.
 $image = docker image inspect copilot-cli-relay:dev-hardening --format '{{.Id}}'
 if ($LASTEXITCODE -ne 0 -or $image -notmatch '\Asha256:[0-9a-f]{64}\z') { throw 'A validated local development image is required.' }
 pwsh scripts/test.ps1 -Image $image
 if ($LASTEXITCODE -ne 0) { throw 'Current source/dependency checks failed.' }
-docker run --rm --pull never --network container:copilot-cli-relay --read-only --tmpfs /tmp:rw,nosuid,nodev,size=32m --mount "type=bind,source=${PWD}/src,target=/app/src,readonly" --mount "type=bind,source=${PWD}/scripts/qualify-responses.py,target=/app/scripts/qualify-responses.py,readonly" $image /app/.venv/bin/python scripts/qualify-responses.py --model gpt-6-astra --run-inference
+$sourceRoot = (Resolve-Path -LiteralPath ./src).ProviderPath
+$harnessSource = (Resolve-Path -LiteralPath ./scripts/qualify-responses.py).ProviderPath
+docker run --rm --pull never --network container:copilot-cli-relay --read-only --tmpfs /tmp:rw,nosuid,nodev,size=32m --mount "type=bind,source=$sourceRoot,target=/app/src,readonly" --mount "type=bind,source=$harnessSource,target=/app/scripts/qualify-responses.py,readonly" $image /app/.venv/bin/python scripts/qualify-responses.py --model gpt-6-astra --run-inference
 ```
 
 Run plan-only with `--network none` and omit `--run-inference`. Use an already

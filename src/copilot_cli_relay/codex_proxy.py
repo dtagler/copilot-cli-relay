@@ -13,7 +13,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from .config import get_settings
-from .errors import openai_json_error, openai_sse_error_event
+from .errors import (
+    openai_json_error,
+    openai_payload_error,
+    openai_sse_error_event,
+    openai_upstream_error_fields,
+)
 from .headers import build_codex_outbound_headers
 from .logging_setup import logger, redact_bytes, redact_text
 from .proxy_shared import (
@@ -29,6 +34,7 @@ from .proxy_shared import (
     read_bounded,
     read_complete_bounded,
 )
+from .request_diagnostics import log_codex_request_size, model_log_label, relay_request_id
 
 COMPACTION_PROMPT = """You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
@@ -134,19 +140,32 @@ def _serialize_json_body(parsed: dict[str, Any]) -> bytes:
     return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def _parse_codex_request(body: bytes, *, request_id: str) -> tuple[bytes, str | None, bool, str]:
+def _parse_codex_request(
+    body: bytes, *, request_id: str, limit_bytes: int | None = None,
+) -> tuple[bytes, str | None, bool, str]:
     try:
         parsed = json.loads(body)
-    except (ValueError, TypeError):
-        return body, None, False, "agent"
+    except (ValueError, TypeError, RecursionError):
+        parsed = None
     if not isinstance(parsed, dict):
+        if limit_bytes is not None:
+            log_codex_request_size(
+                parsed, incoming_bytes=len(body), outgoing_bytes=len(body),
+                limit_bytes=limit_bytes, request_id=request_id,
+            )
         return body, None, False, "agent"
 
     mutated = _rewrite_codex_body(parsed, request_id=request_id)
     streaming = parsed.get("stream") is True
     model = parsed.get("model") if isinstance(parsed.get("model"), str) else None
     initiator = "agent" if _is_agent_call(parsed) else "user"
-    return (_serialize_json_body(parsed) if mutated else body), model, streaming, initiator
+    outgoing = _serialize_json_body(parsed) if mutated else body
+    if limit_bytes is not None:
+        log_codex_request_size(
+            parsed, incoming_bytes=len(body), outgoing_bytes=len(outgoing),
+            limit_bytes=limit_bytes, request_id=request_id,
+        )
+    return outgoing, model, streaming, initiator
 
 
 def _build_codex_headers(
@@ -192,6 +211,17 @@ def _build_openai_upstream_error(
 ) -> Response:
     redacted = redact_bytes(err_bytes, max_bytes=MAX_UPSTREAM_ERROR_BYTES).decode("utf-8", "replace")
     settings = get_settings()
+    code, param = openai_upstream_error_fields(err_bytes, max_bytes=MAX_UPSTREAM_ERROR_BYTES)
+    origin = (
+        "upstream_payload" if status == 413
+        else "upstream_context" if status == 400 and code == "context_length_exceeded"
+        else "upstream"
+    )
+    returned_status = 400 if status == 413 and settings.codex_terminal_payload_errors else status
+    logger.warning(
+        "Codex upstream_error request_id=%s origin=%s original_status=%d status=%d code=%s",
+        request_id, origin, status, returned_status, "request_too_large" if status == 413 else code,
+    )
     if settings.log_bodies:
         logger.warning("upstream %d on %s request_id=%s body=%s", status, route, request_id, redacted[:500])
     else:
@@ -201,16 +231,30 @@ def _build_openai_upstream_error(
             route,
             request_id,
         )
+    if status == 413:
+        # Never turn a byte rejection into a token-context signal. In terminal
+        # mode, Codex sees InvalidRequest rather than retryable UnexpectedStatus.
+        return openai_payload_error(
+            origin=origin, request_id=request_id, terminal=settings.codex_terminal_payload_errors,
+        )
     msg = (
         f"Upstream {status}: {redacted[:300]}"
         if redacted
         else f"Upstream {status} (error body unavailable)"
     )
+    headers = _forwardable_error_headers(upstream_headers) or {}
+    headers.update({
+        "X-Relay-Error-Origin": origin,
+        "X-Relay-Original-Status": str(status),
+        "X-Relay-Request-Id": request_id,
+    })
     return openai_json_error(
         _openai_kind_for_status(status),
         msg,
         status=status,
-        headers=_forwardable_error_headers(upstream_headers),
+        headers=headers,
+        code=code,
+        param=param,
     )
 
 
@@ -354,12 +398,14 @@ async def _codex_stream_response(
 async def proxy_codex_responses(request: Request) -> Response:
     settings = get_settings()
     client: httpx.AsyncClient = request.app.state.http_client
-    request_id = str(uuid.uuid4())
+    request_id = relay_request_id(request)
     started = time.monotonic()
 
     raw_body = await request.body()
-    body, model_id, streaming, initiator = _parse_codex_request(raw_body, request_id=request_id)
-    model = model_id or "?"
+    body, model_id, streaming, initiator = _parse_codex_request(
+        raw_body, request_id=request_id, limit_bytes=settings.max_request_bytes,
+    )
+    model = model_log_label(model_id)
     headers = _build_codex_headers(
         request,
         request_id=request_id,
@@ -619,9 +665,11 @@ async def _synthetic_compact(
 async def proxy_codex_responses_compact(request: Request) -> Response:
     settings = get_settings()
     client: httpx.AsyncClient = request.app.state.http_client
-    request_id = str(uuid.uuid4())
+    request_id = relay_request_id(request)
     raw_body = await request.body()
-    body, _model_id, _streaming, initiator = _parse_codex_request(raw_body, request_id=request_id)
+    body, _model_id, _streaming, initiator = _parse_codex_request(
+        raw_body, request_id=request_id, limit_bytes=settings.max_request_bytes,
+    )
     try:
         parsed = json.loads(body)
     except (ValueError, TypeError):
@@ -712,6 +760,12 @@ def _codex_model_info(model: dict[str, Any], model_id: str) -> dict[str, Any]:
     default_reasoning_level = (
         "medium" if "medium" in reasoning_efforts else reasoning_levels[0]["effort"] if reasoning_levels else None
     )
+    overrides = dict(get_settings().codex_model_overrides.get(model_id, {}))
+    if "auto_compact_token_limit" in overrides:
+        # Mirrors Codex's 90% ceiling without changing the model's real window.
+        overrides["auto_compact_token_limit"] = min(
+            overrides["auto_compact_token_limit"], max(1, context_window * 9 // 10),
+        )
     return {
         "slug": model_id,
         "display_name": name,
@@ -747,7 +801,7 @@ def _codex_model_info(model: dict[str, Any], model_id: str) -> dict[str, Any]:
         "supports_search_tool": False,
         # Only explicit, per-model operator qualification can enable options
         # not established by the upstream fields consumed above.
-        **get_settings().codex_model_overrides.get(model_id, {}),
+        **overrides,
     }
 
 
@@ -847,7 +901,10 @@ async def codex_healthz(request: Request) -> Response:
                 model_count = sum(1 for model in data if isinstance(model, dict) and _model_supports_responses(model))
                 upstream_ok = True
         elif resp.status_code in (401, 403):
-            hint = "token may be expired; re-run scripts/extract-token.ps1 then docker compose up -d --force-recreate proxy"
+            hint = (
+                "token may be expired; refresh the authorized Copilot token in the container environment, "
+                "verify the intended image, and recreate the container to load the updated configuration."
+            )
     except Exception as exc:
         logger.warning("codex_healthz upstream check failed: %s", redact_text(str(exc)))
     body: dict[str, Any] = {

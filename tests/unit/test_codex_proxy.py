@@ -1030,7 +1030,10 @@ def test_codex_healthz_reports_auth_hint_and_handles_exceptions():
     assert auth_response.json()["upstream_ok"] is False
     assert auth_response.json()["upstream_status"] == 401
     assert "token may be expired" in auth_response.json()["hint"]
-    assert "docker compose up -d --force-recreate proxy" in auth_response.json()["hint"]
+    assert "container environment" in auth_response.json()["hint"]
+    assert "verify the intended image" in auth_response.json()["hint"]
+    assert "recreate the container" in auth_response.json()["hint"]
+    assert "extract-token.ps1" not in auth_response.json()["hint"]
 
     def error_handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("health failed")

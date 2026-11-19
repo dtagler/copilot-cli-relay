@@ -1,12 +1,15 @@
 """Admission and upload limits, held through the entire ASGI response lifetime."""
 from __future__ import annotations
 
+import uuid
+
 import anyio
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import get_settings
-from .errors import anthropic_json_error, openai_json_error
+from .errors import anthropic_json_error, openai_json_error, openai_payload_error
+from .logging_setup import logger
 
 
 class RequestLimitsMiddleware:
@@ -19,7 +22,28 @@ class RequestLimitsMiddleware:
             await self.app(scope, receive, send)
             return
         settings = get_settings()
-        error = openai_json_error if scope["path"].startswith("/codex/") else anthropic_json_error
+        codex = scope["path"].startswith("/codex/")
+        error = openai_json_error if codex else anthropic_json_error
+        request_id = str(uuid.uuid4())
+        scope.setdefault("state", {})["relay_request_id"] = request_id
+
+        async def reject_upload(*, declared_bytes: int, observed_bytes: int) -> None:
+            status = 400 if codex and settings.codex_terminal_payload_errors else 413
+            logger.warning(
+                "request_size_rejected request_id=%s protocol=%s origin=relay_upload "
+                "original_status=413 status=%d declared_bytes=%d observed_bytes=%d limit_bytes=%d",
+                request_id, "codex" if codex else "claude", status,
+                declared_bytes, observed_bytes, settings.max_request_bytes,
+            )
+            response = (
+                openai_payload_error(
+                    origin="relay_upload", request_id=request_id,
+                    terminal=settings.codex_terminal_payload_errors, limit_bytes=settings.max_request_bytes,
+                )
+                if codex else error("invalid_request_error", "Request body too large.", status=413)
+            )
+            await response(scope, receive, send)
+
         if self.active >= settings.max_inflight:
             response = error(
                 "server_error" if scope["path"].startswith("/codex/") else "overloaded_error",
@@ -38,7 +62,9 @@ class RequestLimitsMiddleware:
                         await error("invalid_request_error", "Invalid Content-Length.", status=400)(scope, receive, send)
                         return
                     if len(length) > 12 or int(length) > settings.max_request_bytes:
-                        await error("invalid_request_error", "Request body too large.", status=413)(scope, receive, send)
+                        await reject_upload(
+                            declared_bytes=int(length) if len(length) <= 12 else -1, observed_bytes=0,
+                        )
                         return
                 body = bytearray()
                 try:
@@ -49,7 +75,10 @@ class RequestLimitsMiddleware:
                                 return
                             chunk = message.get("body", b"")
                             if len(body) + len(chunk) > settings.max_request_bytes:
-                                await error("invalid_request_error", "Request body too large.", status=413)(scope, receive, send)
+                                await reject_upload(
+                                    declared_bytes=int(length) if length is not None else -1,
+                                    observed_bytes=len(body) + len(chunk),
+                                )
                                 return
                             body.extend(chunk)
                             if not message.get("more_body", False):

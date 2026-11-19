@@ -83,11 +83,14 @@ validate current source/dependencies first. No credentials or user files are mou
 
 ```powershell
 # Explicit approval for inference and the exact model is required.
+# Bind sources must be valid for your selected Docker engine.
 $image = docker image inspect copilot-cli-relay:dev-hardening --format '{{.Id}}'
 if ($LASTEXITCODE -ne 0 -or $image -notmatch '\Asha256:[0-9a-f]{64}\z') { throw 'A validated local development image is required.' }
 pwsh scripts/test.ps1 -Image $image
 if ($LASTEXITCODE -ne 0) { throw 'Current source/dependency checks failed.' }
-docker run --rm --pull never --network container:copilot-cli-relay --read-only --tmpfs /tmp:rw,nosuid,nodev,size=32m --mount "type=bind,source=${PWD}/src,target=/app/src,readonly" --mount "type=bind,source=${PWD}/scripts/qualify-checkpoint.py,target=/app/scripts/qualify-checkpoint.py,readonly" $image /app/.venv/bin/python scripts/qualify-checkpoint.py --model gpt-6-astra --run-inference
+$sourceRoot = (Resolve-Path -LiteralPath ./src).ProviderPath
+$harnessSource = (Resolve-Path -LiteralPath ./scripts/qualify-checkpoint.py).ProviderPath
+docker run --rm --pull never --network container:copilot-cli-relay --read-only --tmpfs /tmp:rw,nosuid,nodev,size=32m --mount "type=bind,source=$sourceRoot,target=/app/src,readonly" --mount "type=bind,source=$harnessSource,target=/app/scripts/qualify-checkpoint.py,readonly" $image /app/.venv/bin/python scripts/qualify-checkpoint.py --model gpt-6-astra --run-inference
 ```
 
 Exit 0 means the short native checkpoint/continuation fixture passed; exit 2

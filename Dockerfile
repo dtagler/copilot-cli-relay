@@ -25,7 +25,7 @@ COPY scripts ./scripts
 COPY docs ./docs
 COPY assets ./assets
 COPY skill ./skill
-COPY README.md ARCHITECTURE.md GLOSSARY.md LICENSE ./
+COPY README.md ARCHITECTURE.md LICENSE ./
 RUN uv lock --check --offline && uv sync --frozen && chown -R app:app /app
 USER app
 CMD ["/app/.venv/bin/uvicorn", "copilot_cli_relay.server:app", "--host", "0.0.0.0", "--port", "4141", "--timeout-graceful-shutdown", "20", "--no-access-log"]

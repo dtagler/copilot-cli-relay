@@ -23,7 +23,7 @@ def anchors(text: str) -> set[str]:
 
 def main() -> None:
     files = [
-        ROOT / "README.md", ROOT / "ARCHITECTURE.md", ROOT / "GLOSSARY.md",
+        ROOT / "README.md", ROOT / "ARCHITECTURE.md",
         *sorted((ROOT / "docs").rglob("*.md")), *sorted((ROOT / "skill").rglob("*.md")),
     ]
     links = 0

@@ -41,8 +41,10 @@ def _set_env(monkeypatch, **kw):
 
 def test_missing_token_raises(monkeypatch):
     _set_env(monkeypatch)
-    with pytest.raises(ConfigError, match="COPILOT_GITHUB_TOKEN is required"):
+    with pytest.raises(ConfigError, match="COPILOT_GITHUB_TOKEN is required") as error:
         Settings.from_env()
+    assert "container environment" in str(error.value)
+    assert "pwsh" not in str(error.value)
 
 
 def test_blank_token_raises(monkeypatch):
@@ -99,7 +101,7 @@ def test_defaults(monkeypatch):
     assert s.github_token == "gho_abc"
     assert s.api_base == "https://api.githubcopilot.com"
     assert s.integration_id == "copilot-developer-cli"
-    assert s.editor_version == "copilot-cli-relay/0.6.0"
+    assert s.editor_version == "copilot-cli-relay/0.7.0"
     assert s.codex_integration_id == "copilot-developer-cli"
     assert s.codex_editor_version == "vscode/1.99.0"
     assert s.codex_plugin_version == "copilot-chat/0.43.2026033101"
